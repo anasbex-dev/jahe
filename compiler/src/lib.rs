@@ -1,0 +1,8 @@
+pub mod diagnostics;
+pub mod frontend;
+pub mod ir;
+pub mod lexer;
+pub mod parser;
+pub mod semantic;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
