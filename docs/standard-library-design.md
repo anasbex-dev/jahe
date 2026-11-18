@@ -36,7 +36,7 @@ The standard library is versioned with the language edition and runtime ABI, whi
 
 ## Implementation order and safeguards
 
-`std.core` owns `Option`, `Result`, `CastError`, and marker traits; `std.mem` owns `Box` and slices; `std.string` owns `String`/UTF-8 utilities; `std.collections` owns vectors/maps/sets; `std.iter` owns `Iterator`; `std.io` and `std.fs` own stream/file error types; `std.net` owns socket/address/error types. These module assignments are designed, not present source modules.
+`std.core` owns `Option`, `Result`, `CastError`, and marker traits; `std.mem` owns `Box` and slices; `std.string` owns `String`/UTF-8 utilities; `std.collections` owns vectors/maps/sets; `std.iter` owns `Iterator`; `std.io` and `std.fs` own stream/file error types; `std.net` owns socket/address/error types. `Option` and `Result` are must-use; code must handle, return, propagate, or explicitly discard them with `let _ = expression;`. These module assignments are designed, not present source modules.
 
 First establish primitive/type/layout rules, then ownership, `Option`/`Result`, and UTF-8 string slices. Add allocation-safe `Box` and `Vec` only after drop and borrow checking. Add formatting before ergonomic I/O, then filesystem, networking, time, and synchronization. Concurrency and atomics follow an explicit data-race and memory-order model. Each module needs portable API documentation, platform-specific behavior notes, tests, and a clear distinction between expected errors and panic conditions.
 

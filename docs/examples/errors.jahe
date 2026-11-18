@@ -13,6 +13,11 @@ func use_config(value: strings.String) {
     io.println(value);
 }
 
+func ignore_config(path: str) {
+    // Explicitly discard a must-use Result when the caller intentionally ignores it.
+    let _ = read_config(path);
+}
+
 func main() -> i32 {
     match read_config("app.conf") {
         core.Result.Ok(text) => { use_config(text); return 0; },

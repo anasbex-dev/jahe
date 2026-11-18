@@ -37,7 +37,7 @@ func report() {
 const PAGE_SIZE: usize = 4096;
 ```
 
-`func` declares a function, `let` an immutable local, `var` a mutable local, and `const` a compile-time constant. Omitted function result means `void`. Parameters have explicit types. Local annotations may be inferred only from a clear initializer. Constants need compile-time expressions. No function overloading is planned.
+`func` declares a function, `let` an immutable local, `var` a mutable local, and `const` a compile-time constant. Omitted function result means `void`. Parameters have explicit types. Local annotations may be inferred only from a clear initializer. Constants need compile-time expressions. `mut` and `self` are reserved keyword tokens, not identifiers; `mut` appears only in mutable reference/pointer and receiver forms. No function overloading is planned.
 
 ## Primitive and composite types
 
@@ -114,7 +114,7 @@ trait Display {
 func identity<T>(value: T) -> T { return value; }
 ```
 
-`impl` groups methods/trait implementations. `trait` declares a capability; generic constraints use `T: Trait`. Inherent methods and static generic dispatch are intended. These features are not implemented. A type and value may have the same spelling because type/value namespaces differ; in expression position value/module roots win, so qualify an associated item through its module when shadowed.
+`impl` groups methods/trait implementations. `trait` declares a capability; generic constraints use `T: Trait`. Inherent methods and static generic dispatch are intended. These features are not implemented. `self` is a value only in a method with a declared `self`, `&self`, or `&mut self` receiver. It cannot appear in an associated function without a receiver; by-value `self` moves into the method, `&self` shares, and `&mut self` exclusively borrows. Its fields and methods resolve like any other receiver. A type and value may have the same spelling because type/value namespaces differ; in expression position value/module roots win, so qualify an associated item through its module when shadowed.
 
 ## References and unsafe operations
 
@@ -131,7 +131,17 @@ unsafe func write_raw(pointer: *mut u8, value: u8) {
 }
 ```
 
-`&T` is a shared borrow, `&mut T` an exclusive borrow, `*const T`/`*mut T` raw pointers. Dereference, pointer arithmetic, and foreign calls require unsafe. The ownership and borrow rules remain a future compiler feature.
+`&T` is a shared borrow, `&mut T` an exclusive borrow, `*const T`/`*mut T` raw pointers. Dereferencing a valid reference or `Box<T>` is safe under borrow checking; raw-pointer dereference, pointer arithmetic, and foreign calls require an unsafe block. The ownership and borrow rules remain a future compiler feature.
+
+```jahe
+func update(value: &mut i32) {
+    *value = 7; // safe mutable-reference place
+}
+
+unsafe func update_raw(pointer: *mut i32) {
+    unsafe { *pointer = 7; }
+}
+```
 
 An `unsafe func` declaration makes calling that function an unsafe operation; unsafe operations inside its body still appear inside explicit `unsafe { ... }` blocks. This design syntax is deferred.
 
@@ -156,7 +166,11 @@ func main() -> i32 {
 }
 ```
 
-Recoverable errors use `Result`; optional values use `Option`; `panic` is unrecoverable. Postfix `?` is a proposed error-propagation convenience, not optional member access, and is not yet frozen or implemented.
+Recoverable errors use must-use `Result`; optional values use must-use `Option`; `panic` is unrecoverable. Handle these values, return them, propagate with `?`, or explicitly discard with `let _ = expression;`. `_` is never a binding and also serves as a wildcard pattern. There is no `discard` statement. Postfix `?` is a designed error-propagation operation, not optional member access; it is not implemented in compiler 0.7.
+
+```jahe
+let _ = read_config(path); // explicit, intentional discard of Result
+```
 
 ## Foreign interface
 
@@ -168,7 +182,7 @@ unsafe func announce(text: *const u8) {
 }
 ```
 
-This sketches the proposed FFI boundary only. Exact C type mapping, layout attributes, linking declarations, and safety wrappers are deferred.
+This sketches the proposed FFI boundary only. Raw dereference and assignment through a raw pointer require an unsafe block; a write target must be `*mut T`. Exact C type mapping, layout attributes, linking declarations, and safety wrappers are deferred.
 
 ## Expressions and precedence
 

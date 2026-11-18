@@ -11,9 +11,11 @@ visibility = "pub" ;
 function-declaration = [ "const" ], [ "unsafe" ], "func", identifier, [ generic-parameters ],
                        "(", [ parameter-list ], ")", [ "->", type ], block ;
 external-function = "extern", string-literal, "func", identifier,
-                    "(", [ parameter-list ], ")",
+                    "(", [ external-parameter-list ], ")",
                     [ "->", type ], ";" ;
 parameter-list = parameter, { ",", parameter }, [ "," ] ;
+external-parameter-list = external-parameter, { ",", external-parameter }, [ "," ] ;
+external-parameter = identifier, ":", type ;
 parameter = receiver | identifier, ":", type ;
 receiver = "self" | "&", [ lifetime ], [ "mut" ], "self" ;
 generic-parameters = "<", generic-parameter, { ",", generic-parameter }, [ "," ], ">" ;
@@ -53,7 +55,8 @@ statement = local-declaration | constant-declaration | return-statement | if-sta
           | while-statement | for-statement | loop-statement | match-statement
           | break-statement | continue-statement | unsafe-block | block
           | assignment-statement | expression, ";" ;
-local-declaration = ( "let" | "var" ), identifier, [ ":", type ], "=", expression, ";" ;
+local-declaration = ( "let" | "var" ), identifier, [ ":", type ], "=", expression, ";"
+                  | "let", "_", "=", expression, ";" ;
 return-statement = "return", [ expression ], ";" ;
 if-statement = "if", expression, block, [ "else", ( block | if-statement ) ] ;
 while-statement = [ loop-label ], "while", expression, block ;
@@ -66,7 +69,10 @@ loop-label-reference = identifier ;
 unsafe-block = "unsafe", block ;
 assignment-statement = place, assignment-operator, expression, ";" ;
 assignment-operator = "=" | "+=" | "-=" | "*=" | "/=" ;
-place = identifier, { ".", ( identifier | tuple-index ) | "[", expression, "]" } ;
+place = place-root, { place-projection } ;
+place-root = identifier | "self" | dereference-place | "(", place, ")" ;
+dereference-place = "*", postfix ;
+place-projection = ".", ( identifier | tuple-index ) | "[", expression, "]" ;
 
 match-statement = "match", expression, "{", [ match-arm, { ",", match-arm }, [ "," ] ], "}" ;
 match-arm = pattern, [ "if", expression ], "=>", ( expression | block ) ;
@@ -102,7 +108,7 @@ tuple-index-suffix = ".", tuple-index ;
 tuple-index = digit, { digit } ;
 propagation-suffix = "?" ;
 cast-suffix = "as", type ;
-primary = literal | identifier | "(", expression, ")"
+primary = literal | identifier | "self" | "(", expression, ")"
         | "(", expression, ",", [ expression-list ], ")"
         | array-literal | struct-literal ;
 expression-list = expression, { ",", expression }, [ "," ] ;
@@ -122,5 +128,9 @@ escape = "\\", ( "n" | "r" | "t" | "0" | "\\" | "'" | '"' | "u{", hex-digit, { h
 (* Repeated postfix suffixes bind left-to-right, enabling chained calls, indexing, and member access. *)
 (* Match is statement-only; expression-valued match, if expressions, and block expressions are deferred. *)
 (* A tuple index is a dot followed by a decimal integer token; a float literal such as 10.0 remains one token. *)
+(* Assignment lhs is a place only: a local/root, projections, or an explicit dereference; other unary expressions are excluded. *)
+(* `self` is parsed as an expression but is semantically valid only for a method with a receiver. *)
+(* `mut` is a reserved keyword, used only in mutable-reference/receiver and raw-pointer type syntax. *)
+(* External C parameters cannot use method receivers. Only ABI `C` is selected initially; unsupported ABI strings diagnose. *)
 (* Whitespace and // line comments may occur between tokens. Literal decoding is UTF-8. A character-literal contains exactly one Unicode scalar. *)
-(* Lexical classes letter-or-underscore, digit, hex-digit, string-character are conventional. *)
+(* Lexical classes letter-or-underscore, digit, hex-digit, string-character are conventional; reserved keyword tokens are excluded from identifier. *)

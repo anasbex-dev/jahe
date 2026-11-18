@@ -15,6 +15,8 @@ Compiler 0.7 has compile-time diagnostics and an aborting runtime panic entry po
 
 This exact-match rule avoids hidden trait conversions and makes propagation easy to type-check before a richer conversion trait exists. Its cost is explicit mapping at API boundaries.
 
+`Result<T,E>` and `Option<T>` are must-use: a value must be matched/otherwise consumed, returned, propagated with `?`, or explicitly discarded. The single explicit discard form is `let _ = operation();`. `_` is not a local binding; it is also a wildcard pattern in `match`. There is no separate `discard` statement. The discard form applies to any expression type, but discarding `Result`/`Option` must be intentional and remains visible in source. Unused ordinary non-void expression results produce a warning; ordinary expression statements are valid when they have type `void`. A function's own return value must likewise be consumed, returned, matched, propagated, or explicitly discarded at its call site when it is must-use.
+
 ## Panic, cleanup, and reporting
 
 `panic(message)` has type `never`, prints a best-effort diagnostic with source/runtime context, and aborts the process. It does not unwind; destructors are not run after panic. No catch/recover, exceptions, `throw`, or `try` construct is part of the language. This is simpler and ABI-safe, though it cannot recover resources after fatal failure. Ordinary environmental failures must use `Result`.
@@ -29,4 +31,4 @@ The runtime ABI v1 output functions return status; current compiler-generated na
 
 ## Diagnostics and prerequisites
 
-Required static errors include non-exhaustive match, invalid `?` context, mismatched error type, use of a recoverable result without handling/explicit discard, and incompatible FFI error mapping. Generic enum support and match are prerequisites for library `Option`/`Result`; ownership/drop semantics precede safe resource errors; module and runtime ABI resolution precede cross-module wrappers. No exception or unwinding design is planned.
+Required diagnostics include non-exhaustive match, invalid `?` context, mismatched error type, ignored must-use `Result`/`Option`, invalid discard syntax, and incompatible FFI error mapping. Unused ordinary non-void values are warnings, not errors. Generic enum support and match are prerequisites for library `Option`/`Result`; ownership/drop semantics precede safe resource errors; module and runtime ABI resolution precede cross-module wrappers. No exception or unwinding design is planned.
