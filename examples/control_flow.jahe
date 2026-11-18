@@ -6,8 +6,10 @@ fn main() -> i32 {
         counter = counter + 1;
     }
     if counter > 5 {
+        println(counter);
         return counter;
     } else {
+        println(0);
         return 0;
     }
 }

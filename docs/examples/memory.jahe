@@ -1,0 +1,13 @@
+// Designed syntax only; Box and borrow checking are not implemented.
+module memory_demo;
+import std.mem as mem;
+import std.core as core;
+
+struct Node { value: i32, next: core::Option<mem::Box<Node>> }
+
+func sum_first(node: &Node) -> i32 { return node.value; }
+
+func main() -> i32 {
+    let root: mem::Box<Node> = mem::Box::new(Node { value: 7, next: core::Option::None });
+    return sum_first(&*root);
+}

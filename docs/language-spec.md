@@ -1,47 +1,29 @@
-# JAHE Language and Compiler 0.4
+# JAHE compiler 0.7 accepted syntax snapshot
 
-This document describes syntax and semantic checks accepted by the bootstrap frontend. Semantic checking is not code generation.
+This page records what the current bootstrap frontend accepts. It is deliberately separate from the designed future language in [language-specification.md](language-specification.md). This is not the full design grammar.
 
-## Modules and functions
+## Current accepted forms
 
-Each file starts with one module declaration followed by zero or more functions:
+Each source file contains one module declaration and functions using `fn`:
 
 ```jahe
 module hello;
-fn main() -> i32 { return 0; }
+fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn main() -> i32 { println(add(20, 22)); return 0; }
 ```
 
-Functions have named, typed parameters, an optional `-> type` return type (omitted means `void`), and a braced body. Supported types are `i32`, `i64`, `f32`, `f64`, `bool`, `str`, and `void`.
+The supported source types are `i32`, `i64`, `f32`, `f64`, `bool`, `str`, and `void`. Function arguments and return types are explicit; omitted return type means `void`. Functions can call and recurse by declared name. Function overloading is rejected.
 
-## Statements and control flow
+Statements include `let name: Type = expression;`, `let mut name: Type = expression;`, assignment to mutable locals, `return` with optional value, expression statements, nested blocks, `if`/`else`, and `while`. Declarations require initializers. Blocks create lexical scopes; nested scopes can shadow outer names, while same-scope duplicates are errors. There is no `var`, `const`, `import`, or source visibility syntax.
 
-The parser accepts typed variable declarations, returns, expression statements, nested blocks, `if`/`else`, and `while`. Statements end in semicolons except blocks/control-flow constructs. Each function and nested block creates a lexical scope. Nested blocks may shadow outer variables; duplicate names in one scope are errors. Declarations are immutable unless written `let mut`. Assignment is a statement and is permitted only for mutable locals.
+Expressions include identifiers, integer/float/string/bool literals, parentheses, calls, `+ - * /`, and comparisons `== != < <= > >=`. There are no unary operators or logical operators in the current parser. Numeric binary operands must have matching supported types; no implicit conversion occurs. Integer literals infer `i32` when possible, otherwise `i64`; floats infer `f64`. Strings support `\\n`, `\\t`, `\\r`, `\\"`, and `\\\\`. `//` comments are accepted. Identifiers use ASCII letters/underscore and digits after the first character.
 
-```jahe
-let count: i32 = 2;
-return count;
-println("hello");
-let mut counter: i32 = 0;
-while counter < 10 { counter = counter + 1; }
-if counter == 10 { println(true); } else { println(false); }
-```
+`println` accepts one supported value and returns void. Semantic analysis checks declarations, names, argument counts/types, operators, assignments, conditions, and returns. Non-void functions require a return on all modeled paths; while loops are not assumed to execute.
 
-Return values are optional. Variable initializers are required.
+## Backend behavior
 
-## Expressions and tokens
+The typed verified IR supports SSA values, functions/calls, constants, arithmetic/comparisons, phi nodes, branches and returns. The interpreter remains available. Native compilation uses Cranelift on Windows x86_64 and the runtime ABI described by [runtime-abi.md](runtime-abi.md). Native builds require `fn main() -> i32`; generated code supports only the native subset documented in [backend-design.md](backend-design.md).
 
-Expressions support identifiers, integer and decimal floating-point literals, strings, booleans, parenthesized expressions, calls, and binary `==`, `!=`, `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/` operators. Arithmetic requires matching numeric types. Comparisons require matching comparable types and produce `bool`. Integer literals infer `i32` when in range, otherwise `i64`; floating literals infer `f64`. Strings support `\\n`, `\\t`, `\\r`, `\\"`, and `\\\\`. `//` comments extend to the line end.
+## Not accepted today
 
-The semantic pass resolves variables, parameters, and declared functions, checks initializer, argument, operator, and return types, and reports duplicate declarations. The built-in `println` currently accepts one argument of any supported value type and returns `void`.
-
-Identifiers use ASCII letters/underscore initially and ASCII letters/digits/underscore thereafter. All numeric literals are decimal. Integer literals must fit signed 64-bit range.
-
-## Not implemented
-
-There is no implicit numeric conversion, break/continue, short-circuit boolean syntax, user-defined types, imports, ownership checking, unsafe blocks, memory management implementation, LLVM integration, or native executable generation. Non-void functions need a return on all statically modeled paths: both arms of an `if/else` can establish this; a while loop is never assumed to execute. These unsupported features should not be assumed to work.
-
-## Typed intermediate representation
-
-The `ir` CLI command lowers semantically valid programs into a backend-neutral typed CFG/SSA IR. Functions contain uniquely numbered basic blocks, typed parameters, constants, binary and call instructions, phi nodes, branches, conditional branches, and return terminators. Mutable assignments are represented by new SSA values and phi nodes at control-flow merges and loop headers. Values carry explicit IR types and expression source spans. Calls use symbolic function names; `println` is a recognized built-in. The validator checks value definitions, use ordering/dominance, phi placement and inputs, signatures, references, instruction/result types, block structure, branch conditions/targets, reachability, and return types.
-
-The current IR has no break/continue, short-circuit operators, global data, target layouts, machine types, ownership operations, or backend/code-generation rules. Its control-flow graph supports only the constructs listed above. It is an in-memory compiler representation and textual dump, not executable code. `void` return-path completeness is checked for reachable fallthrough; a `while` loop is conservatively allowed to exit.
+The proposed canonical `func`, `var`, `const`, `import`, `pub`, struct/enum/trait/generic syntax, `for`/`loop`/`match`, references, pointers, ownership, unsafe blocks, source FFI, `Option`/`Result`, and standard-library modules are designed or deferred only. They must not be presented as implemented.

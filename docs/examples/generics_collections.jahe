@@ -1,0 +1,14 @@
+// Designed syntax only; these standard-library types are not present yet.
+module collections_demo;
+import std.collections as collections;
+import std.core as core;
+
+func first<T>(items: &[T]) -> core::Option<&T> {
+    if items.len() == 0 { return core::Option::None; }
+    return core::Option::Some(&items[0]);
+}
+
+func main() -> i32 {
+    let values: collections::Vec<i32> = collections::Vec::new();
+    return 0;
+}

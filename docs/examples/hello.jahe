@@ -1,0 +1,9 @@
+// Designed example; `func`, `var`, and `std.io` are not compiler-0.7 syntax.
+module hello;
+import std.io as io;
+
+func main() -> i32 {
+    let greeting: str = "Hello, JAHE";
+    io::println(greeting);
+    return 0;
+}

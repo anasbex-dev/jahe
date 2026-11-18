@@ -1,0 +1,8 @@
+// Designed syntax only; source FFI and unsafe blocks are not implemented.
+module native_api;
+
+extern "C" func puts(text: *const u8) -> i32;
+
+unsafe func write_message(text: *const u8) -> i32 {
+    unsafe { return puts(text); }
+}

@@ -4,7 +4,7 @@ JAHE is an experimental compiled systems programming language inspired by C and 
 
 ## Status
 
-Compiler 0.4.0 is the IR foundation release candidate. The Rust bootstrap compiler includes the JAHE 0.1 frontend, JAHE 0.2 semantic checks, and a backend-neutral typed CFG/SSA IR. `check` runs syntax and semantic checks; `ir` lowers supported source to readable IR. No command generates native code. The project is experimental and not production-ready. Unsupported syntax is documented in [the language specification](docs/language-spec.md).
+Compiler 0.7.0 keeps the verified, backend-neutral IR and interpreter, and adds a versioned runtime foundation alongside the Cranelift native backend for Windows x86_64. Native builds emit COFF objects and link a static `jahe-runtime` library through the MSVC toolchain. The project is experimental and not production-ready. The accepted compiler syntax is documented in [the implementation snapshot](docs/language-spec.md); the proposed complete language design is in [the language specification](docs/language-specification.md).
 
 ## Build
 
@@ -18,25 +18,32 @@ cargo build --manifest-path compiler/Cargo.toml
 
 ```sh
 cargo run --manifest-path compiler/Cargo.toml -- --version
+cargo run --manifest-path compiler/Cargo.toml -- runtime-info
 cargo run --manifest-path compiler/Cargo.toml -- check examples/hello.jahe
 cargo run --manifest-path compiler/Cargo.toml -- tokens examples/hello.jahe
 cargo run --manifest-path compiler/Cargo.toml -- ast examples/hello.jahe
 cargo run --manifest-path compiler/Cargo.toml -- ir examples/hello.jahe
 cargo run --manifest-path compiler/Cargo.toml -- ir examples/control_flow.jahe
+cargo run --manifest-path compiler/Cargo.toml -- run examples/hello.jahe
+cargo run --manifest-path compiler/Cargo.toml -- run examples/arithmetic.jahe
+cargo run --manifest-path compiler/Cargo.toml -- run examples/functions.jahe
+cargo run --manifest-path compiler/Cargo.toml -- run examples/control_flow.jahe
+cargo run --manifest-path compiler/Cargo.toml -- run examples/loops.jahe
+cargo run --manifest-path compiler/Cargo.toml -- build examples/arithmetic.jahe
 ```
 
-`tokens` prints the lexical stream, `ast` prints the parsed syntax tree, `check` performs parsing and semantic validation, and `ir` prints validated typed IR. There is no native compilation command yet.
+`tokens` prints the lexical stream, `ast` prints the parsed syntax tree, `check` performs parsing and semantic validation, `ir` prints validated typed IR, `run` interprets a module's `main` function, and `build` emits `examples/arithmetic.obj` and `examples/arithmetic.exe`. Native builds currently require a Windows x86_64 host and Visual Studio C++ Build Tools (including `cl.exe` and `link.exe`). An `i32 main` return in the range 0–255 becomes the process exit status when interpreted; a `void main` exits with 0. Native executable entry points must be `fn main() -> i32`. Unsupported native operations and external host functions are diagnosed instead of generating guessed code.
 
 ## Design philosophy
 
-The bootstrap compiler keeps lexing, parsing, AST definitions, diagnostics, semantic analysis, typed IR, lowering, and validation in separate modules. The IR models control flow and SSA values without LLVM or target-machine dependencies and can serve as a boundary for multiple future backends. See [the IR design](docs/ir-design.md). Small, explicit milestones are preferred over claiming unfinished language features.
+The bootstrap compiler keeps lexing, parsing, AST definitions, diagnostics, semantic analysis, typed IR, verification, backends, and interpretation in separate modules. Backends consume a `VerifiedModule` created by the independent IR verifier, so normal backend calls cannot receive unverified IR. Modules declare external functions with backend-neutral signatures; host implementations are registered separately by the interpreter. Host functions are not automatically available to JAHE source programs, and source-level external declarations are not yet supported. See [the IR design](docs/ir-design.md) and [backend design](docs/backend-design.md). Small, explicit milestones are preferred over claiming unfinished language features.
 
 ## Project map
 
 - `compiler/`: Rust bootstrap compiler.
-- `runtime/`: reserved for future runtime components.
+- `runtime/`: versioned `jahe-runtime` ABI crate with static library, I/O, memory, and panic services.
 - `std/`: reserved for a future standard library.
 - `examples/`: sample JAHE source.
 - `docs/`: syntax and milestone roadmap.
 
-See [docs/roadmap.md](docs/roadmap.md) for planned next steps.
+See [the implementation roadmap](docs/roadmap.md) for compiler history and [the language roadmap](docs/language-roadmap.md) for proposed language phases. The [syntax reference](docs/syntax-reference.md), [grammar](docs/grammar.ebnf), [design decisions](docs/language-design-decisions.md), [type system](docs/type-system.md), [memory model](docs/memory-model.md), [module system](docs/module-system.md), [error handling](docs/error-handling.md), and [standard library design](docs/standard-library-design.md) describe proposed features, not current compiler support.

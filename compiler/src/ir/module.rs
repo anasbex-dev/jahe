@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub name: String,
+    pub externals: Vec<super::ExternalFunction>,
     pub functions: Vec<super::Function>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,0 +1,21 @@
+// Designed syntax only; Result and match are deferred.
+module errors_demo;
+import std.fs;
+import std.io as io;
+import std.core as core;
+import std.string as strings;
+
+func read_config(path: str) -> core::Result<strings::String, fs::Error> {
+    return fs::read_to_string(path);
+}
+
+func use_config(value: strings::String) {
+    io::println(value);
+}
+
+func main() -> i32 {
+    match read_config("app.conf") {
+        core::Result::Ok(text) => { use_config(text); return 0; },
+        core::Result::Err(error) => { io::println(error); return 1; },
+    }
+}

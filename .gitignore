@@ -1,3 +1,4 @@
 /target/
 /compiler/target/
+/runtime/target/
 *.rs.bk

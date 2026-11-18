@@ -1,6 +1,6 @@
 use jahe_compiler::{
     frontend,
-    ir::{self, InstructionKind, Terminator, Type},
+    ir::{self, ExternalFunction, InstructionKind, Signature, Terminator, Type},
 };
 
 fn lower(source: &str) -> ir::Module {
@@ -107,6 +107,43 @@ fn validator_rejects_unknown_function_and_bad_return_type() {
     };
     let errors = ir::validate::validate(&module).unwrap_err();
     assert!(errors.iter().any(|e| e.code == "IR0017"));
+}
+
+#[test]
+fn verifier_checks_external_signatures_and_declaration_conflicts() {
+    let mut module = lower("module m; fn main() { println(1); }");
+    let call = module.functions[0].blocks[0]
+        .instructions
+        .iter_mut()
+        .find(|instruction| matches!(&instruction.kind, InstructionKind::Call { .. }))
+        .unwrap();
+    if let InstructionKind::Call { function, .. } = &mut call.kind {
+        *function = "host".into();
+    }
+    // A valid explicit external declaration resolves the call.
+    module.externals.push(ExternalFunction::new(
+        "host",
+        Signature::exact([Type::I32], Type::Void),
+        module.functions[0].span,
+    ));
+    ir::verify::Verifier.verify(&module).unwrap();
+
+    module.externals.push(ExternalFunction::new(
+        "host",
+        Signature::exact([Type::I64], Type::Void),
+        module.functions[0].span,
+    ));
+    assert!(ir::validate::validate(&module)
+        .unwrap_err()
+        .iter()
+        .any(|e| e.code == "IR0041"));
+
+    let mut missing = lower("module m; fn main() { println(1); }");
+    missing.externals.retain(|e| e.name != "println");
+    assert!(ir::validate::validate(&missing)
+        .unwrap_err()
+        .iter()
+        .any(|e| e.code == "IR0017"));
 }
 
 #[test]

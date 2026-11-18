@@ -3,6 +3,23 @@ use std::fmt::Write;
 pub fn format(module: &Module) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "module {}", module.name);
+    for external in &module.externals {
+        let params = external
+            .signature
+            .params
+            .iter()
+            .map(|p| match p {
+                super::ParameterType::Exact(ty) => ty.to_string(),
+                super::ParameterType::AnyValue => "any-value".into(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            o,
+            "extern @{}({params}) -> {}",
+            external.name, external.signature.return_type
+        );
+    }
     for f in &module.functions {
         let ps = f
             .params

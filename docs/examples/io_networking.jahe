@@ -1,0 +1,18 @@
+// Designed syntax only; std.net and std.io modules do not exist yet.
+module client;
+import std.io as io;
+import std.core as core;
+import std.string as strings;
+import net.http as web;
+
+func fetch_title(address: str) -> core::Result<strings::String, web::Error> {
+    let response: web::Response = web::get(address)?;
+    return response.text();
+}
+
+func main() -> i32 {
+    match fetch_title("https://example.invalid/") {
+        core::Result::Ok(title) => { io::println(title); return 0; },
+        core::Result::Err(error) => { io::println(error); return 1; },
+    }
+}

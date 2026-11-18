@@ -1,6 +1,6 @@
 use super::{
-    control_flow, ssa, BinaryOp, BlockId, Constant, Diagnostic, Function, InstructionKind, Module,
-    Terminator, Type, Value, ValueId,
+    control_flow, ssa, BinaryOp, BlockId, Constant, Diagnostic, ExternalFunction, Function,
+    InstructionKind, Module, ParameterType, Signature, Terminator, Type, Value, ValueId,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Clone, Copy)]
@@ -12,28 +12,59 @@ struct Def {
 
 pub fn validate(module: &Module) -> Result<(), Vec<Diagnostic>> {
     let mut errors = Vec::new();
-    let mut sigs = HashMap::new();
-    for f in &module.functions {
-        if sigs
-            .insert(
-                f.name.clone(),
-                (
-                    f.params.iter().map(|p| p.value.ty).collect::<Vec<_>>(),
-                    f.return_type,
-                ),
-            )
-            .is_some()
-        {
+    let mut sigs: HashMap<String, Signature> = HashMap::new();
+    for external in &module.externals {
+        if let Some(previous) = sigs.insert(external.name.clone(), external.signature.clone()) {
+            let same = previous == external.signature;
             err(
                 &mut errors,
-                "IR0001",
-                format!("duplicate function `{}`", f.name),
-                f.span,
+                if same { "IR0040" } else { "IR0041" },
+                format!(
+                    "{} external declaration `{}`",
+                    if same { "duplicate" } else { "conflicting" },
+                    external.name
+                ),
+                external.span,
             );
         }
+        for param in &external.signature.params {
+            if matches!(param, ParameterType::Exact(Type::Void)) {
+                err(
+                    &mut errors,
+                    "IR0042",
+                    format!("external `{}` has a void parameter", external.name),
+                    external.span,
+                );
+            }
+        }
     }
-    for f in &module.functions {
-        validate_fn(f, &sigs, &mut errors);
+    for function in &module.functions {
+        if let Some(previous) = sigs.insert(
+            function.name.clone(),
+            Signature::exact(
+                function.params.iter().map(|p| p.value.ty),
+                function.return_type,
+            ),
+        ) {
+            let code = if module.externals.iter().any(|e| e.name == function.name) {
+                "IR0043"
+            } else {
+                "IR0001"
+            };
+            err(
+                &mut errors,
+                code,
+                format!(
+                    "function `{}` conflicts with an existing declaration",
+                    function.name
+                ),
+                function.span,
+            );
+            let _ = previous;
+        }
+    }
+    for function in &module.functions {
+        validate_fn(function, &sigs, &mut errors);
     }
     if errors.is_empty() {
         Ok(())
@@ -41,7 +72,29 @@ pub fn validate(module: &Module) -> Result<(), Vec<Diagnostic>> {
         Err(errors)
     }
 }
-fn validate_fn(f: &Function, sigs: &HashMap<String, (Vec<Type>, Type)>, e: &mut Vec<Diagnostic>) {
+
+pub fn validate_with_externals(
+    module: &Module,
+    externals: &HashMap<String, (Vec<Type>, Type)>,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut combined = module.clone();
+    let mut declarations = externals.iter().collect::<Vec<_>>();
+    declarations.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, (params, return_type)) in declarations {
+        let span = module
+            .functions
+            .first()
+            .map(|f| f.span)
+            .unwrap_or(crate::lexer::token::Span { line: 1, column: 1 });
+        combined.externals.push(ExternalFunction::new(
+            name,
+            Signature::exact(params.iter().copied(), *return_type),
+            span,
+        ));
+    }
+    validate(&combined)
+}
+fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diagnostic>) {
     if f.blocks.is_empty() {
         err(
             e,
@@ -132,7 +185,10 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, (Vec<Type>, Type)>, e: &mut 
                     let valid = match (c, inst.result.as_ref().map(|v| v.ty)) {
                         (Constant::Integer(v), Some(Type::I32)) => i32::try_from(*v).is_ok(),
                         (Constant::Integer(_), Some(Type::I64)) => true,
-                        (Constant::Float(_), Some(Type::F32 | Type::F64)) => true,
+                        (Constant::Float(v), Some(Type::F32)) => {
+                            v.is_finite() && v.abs() <= f32::MAX as f64
+                        }
+                        (Constant::Float(_), Some(Type::F64)) => true,
                         (Constant::String(_), Some(Type::Str)) => true,
                         (Constant::Bool(_), Some(Type::Bool)) => true,
                         _ => false,
@@ -173,20 +229,23 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, (Vec<Type>, Type)>, e: &mut 
                     for a in args {
                         check_use(a, b.id, i, &defs, &dom, e);
                     }
-                    if function == "println" {
-                        if args.len() != 1 || inst.result.is_some() {
-                            err(e, "IR0015", "invalid println call signature", inst.span);
-                        }
-                    } else if let Some((params, result)) = sigs.get(function) {
-                        if args.len() != params.len()
-                            || args.iter().zip(params).any(|(a, t)| a.ty != *t)
-                            || (*result == Type::Void) != inst.result.is_none()
-                            || inst.result.as_ref().is_some_and(|v| v.ty != *result)
+                    if let Some(signature) = sigs.get(function) {
+                        let result = signature.return_type;
+                        if args.len() != signature.params.len()
+                            || args
+                                .iter()
+                                .zip(&signature.params)
+                                .any(|(a, expected)| !expected.accepts(a.ty))
+                            || (result == Type::Void) != inst.result.is_none()
+                            || inst.result.as_ref().is_some_and(|v| v.ty != result)
                         {
                             err(
                                 e,
                                 "IR0016",
-                                format!("call to `{function}` does not match signature"),
+                                format!(
+                                    "call to `{function}` does not match declared signature {}",
+                                    format_signature(signature)
+                                ),
                                 inst.span,
                             );
                         }
@@ -290,6 +349,18 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, (Vec<Type>, Type)>, e: &mut 
             None => {}
         }
     }
+}
+fn format_signature(signature: &Signature) -> String {
+    let params = signature
+        .params
+        .iter()
+        .map(|p| match p {
+            ParameterType::Exact(t) => t.to_string(),
+            ParameterType::AnyValue => "any-value".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({params}) -> {}", signature.return_type)
 }
 fn insert_def(
     m: &mut HashMap<ValueId, Def>,

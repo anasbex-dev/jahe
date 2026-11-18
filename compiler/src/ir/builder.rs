@@ -1,17 +1,19 @@
 use super::{
-    BasicBlock, BlockId, Diagnostic, Function, Instruction, InstructionKind, Module, Parameter,
-    Terminator, Type, Value, ValueId,
+    BasicBlock, BlockId, Diagnostic, ExternalFunction, Function, Instruction, InstructionKind,
+    Module, Parameter, Terminator, Type, Value, ValueId,
 };
 use crate::lexer::token::Span;
 
 pub struct ModuleBuilder {
     name: String,
+    externals: Vec<ExternalFunction>,
     functions: Vec<Function>,
 }
 impl ModuleBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            externals: Vec::new(),
             functions: Vec::new(),
         }
     }
@@ -26,9 +28,36 @@ impl ModuleBuilder {
         self.functions.push(function);
         Ok(())
     }
+    pub fn add_external(&mut self, external: ExternalFunction) -> Result<(), Diagnostic> {
+        if let Some(existing) = self.externals.iter().find(|e| e.name == external.name) {
+            let detail = if existing.signature == external.signature {
+                "duplicate"
+            } else {
+                "conflicting"
+            };
+            return Err(Diagnostic {
+                code: "IRB009",
+                message: format!("{detail} external declaration `{}`", external.name),
+                span: external.span,
+            });
+        }
+        if self.functions.iter().any(|f| f.name == external.name) {
+            return Err(Diagnostic {
+                code: "IRB010",
+                message: format!(
+                    "external `{}` conflicts with a function definition",
+                    external.name
+                ),
+                span: external.span,
+            });
+        }
+        self.externals.push(external);
+        Ok(())
+    }
     pub fn finish(self) -> Result<Module, Vec<Diagnostic>> {
         let module = Module {
             name: self.name,
+            externals: self.externals,
             functions: self.functions,
         };
         super::validate::validate(&module)?;

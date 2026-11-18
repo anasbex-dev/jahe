@@ -1,0 +1,12 @@
+// Designed syntax only.
+module geometry;
+
+pub struct Point { pub x: f64, pub y: f64 }
+
+impl Point {
+    pub func origin() -> Point { return Point { x: 0.0, y: 0.0 }; }
+
+    pub func shifted(&self, dx: f64, dy: f64) -> Point {
+        return Point { x: self.x + dx, y: self.y + dy };
+    }
+}

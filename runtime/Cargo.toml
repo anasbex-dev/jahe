@@ -1,0 +1,10 @@
+[package]
+name = "jahe-runtime"
+version = "0.7.0"
+edition = "2021"
+description = "Stable C ABI runtime for native JAHE executables"
+license = "MIT"
+
+[lib]
+name = "jahe_runtime"
+crate-type = ["rlib", "staticlib"]

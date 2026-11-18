@@ -1,6 +1,6 @@
 # JAHE IR design (0.4 foundation)
 
-The IR belongs to JAHE and is independent of LLVM and target architecture. Frontend lowering consumes the typed AST only after semantic analysis succeeds. Future LLVM and native backends should consume this same IR through backend-specific adapters; neither backend types nor target layout rules belong in the IR model.
+The IR belongs to JAHE and is independent of Cranelift and target architecture. Frontend lowering consumes the typed AST only after semantic analysis succeeds. The interpreter and Cranelift native backend consume this same IR through backend-specific adapters; neither backend types nor target layout rules belong in the IR model.
 
 ## Architecture
 

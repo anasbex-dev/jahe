@@ -1,6 +1,6 @@
 use super::{
-    BasicBlock, BinaryOp, BlockId, Constant, Diagnostic, Function, Instruction, InstructionKind,
-    Module, Parameter, Terminator, Type, Value, ValueId,
+    BasicBlock, BinaryOp, BlockId, Constant, Diagnostic, ExternalFunction, Function, Instruction,
+    InstructionKind, Module, Parameter, ParameterType, Signature, Terminator, Type, Value, ValueId,
 };
 use crate::{
     lexer::token::Span,
@@ -48,9 +48,19 @@ pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
     }
     let m = Module {
         name: ast.name.clone(),
+        externals: vec![ExternalFunction::new(
+            "println",
+            Signature {
+                params: vec![ParameterType::AnyValue],
+                return_type: Type::Void,
+            },
+            ast.functions
+                .first()
+                .map(|f| f.span)
+                .unwrap_or(Span { line: 1, column: 1 }),
+        )],
         functions,
     };
-    super::validate::validate(&m)?;
     Ok(m)
 }
 fn map_ty(s: &str) -> Type {

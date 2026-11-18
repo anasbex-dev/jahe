@@ -1,0 +1,7 @@
+module arithmetic;
+
+fn main() -> i32 {
+    let result: i32 = (6 * 7) + 0;
+    println(result);
+    return 0;
+}
