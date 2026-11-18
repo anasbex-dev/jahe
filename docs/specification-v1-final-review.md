@@ -68,6 +68,24 @@ Markdown relative links and referenced example paths were checked. The final EBN
 
 Deferred topics include advanced raw-pointer provenance models; closures and async; unions and `repr(C)` aggregates; associated types, specialization and dynamic trait objects; block/`if`/`match` expressions; static/global storage; inline assembly, volatile, atomics, threading and synchronization; conditional compilation; workspaces/features, registry trust/signing/key lifecycle, multiple simultaneous package versions, and non-Windows ABIs. The proposed borrow checker remains a design and must pass soundness testing before JAHE claims safe code. Lockfiles cannot authenticate first resolution without a future trust mechanism.
 
+## Final correction: standalone `_` token
+
+The previous grammar allowed `_` as an `identifier` because identifiers could start with an underscore, while also using `_` for wildcard patterns and `let _` discard. The EBNF now defines `wildcard-token = "_"` separately and defines an identifier as either a letter followed by identifier continuations or an underscore followed by at least one continuation. Thus the standalone token cannot be a name, while `_value`, `value_`, and `__internal` remain identifiers. Longest-match tokenization makes `_value` one identifier; numeric underscores remain separators only between digits. The grammar permits the wildcard token only in wildcard patterns and the specific `let _ = expression;` production. Since `var` declarations and all declaration/name positions require `identifier`, `var _`, `func _`, `_` fields/variants/aliases/type parameters/lifetimes are invalid. Diagnostics should identify `_` as the reserved wildcard/discard token and ask for a nonempty name.
+
+The exact discard form and all prior design decisions are unchanged. Updated files in this correction: `docs/grammar.ebnf`, `docs/language-design-decisions.md`, `docs/language-specification.md`, `docs/syntax-reference.md`, `docs/type-system.md`, and this report. README links already pointed to this review and required no update.
+
+Validation for this correction:
+
+- `rg -n '_' README.md docs`: **run and reviewed**. Standalone `_` occurrences are wildcard/discard references or the explicit grammar token; embedded underscores are identifier continuations/examples, numeric separators, compiler/Rust notation such as `_Bool` and `jahe_rt_v1_`, or file/module/path names such as `control_flow` and `x86_64`.
+- `rg -n -i 'discard|let _|var _' README.md docs`: **run and reviewed**. `let _ = expression;` remains the only discard syntax; mentions of `var _` explicitly mark it invalid; no `discard` statement syntax was introduced.
+- `rg -n -P '(func|struct|enum|trait|type|import|as|let|var|const|<)\s+_\b' README.md docs`: **run and reviewed**. Matches were prose explaining wildcard/discard rules and examples, not declarations accepting `_` as a name.
+- Relative Markdown link validation over README and docs: **passed**.
+- `git diff --check`: **passed**.
+- EBNF/example validation: **reviewed**. The grammar explicitly separates wildcard token from identifiers. Source-language uses are wildcard/discard or part of longer identifiers/numeric separators; other occurrences are implementation notation, ABI symbols, or paths. No compiler parser was invoked; these proposed forms are not implemented in compiler 0.7.
+- Initial `git status --short` before this correction was clean. After correction, status contains only the six documentation files listed above; no implementation file or dependency changed.
+
+Remaining limitation: diagnostics are a specified compiler behavior, not implemented or exercised by compiler 0.7. No implementation validation is claimed.
+
 ## Exact files changed
 
 - `docs/grammar.ebnf`

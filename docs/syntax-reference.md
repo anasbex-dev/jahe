@@ -37,7 +37,7 @@ func report() {
 const PAGE_SIZE: usize = 4096;
 ```
 
-`func` declares a function, `let` an immutable local, `var` a mutable local, and `const` a compile-time constant. Omitted function result means `void`. Parameters have explicit types. Local annotations may be inferred only from a clear initializer. Constants need compile-time expressions. `mut` and `self` are reserved keyword tokens, not identifiers; `mut` appears only in mutable reference/pointer and receiver forms. No function overloading is planned.
+`func` declares a function, `let` an immutable local, `var` a mutable local, and `const` a compile-time constant. Omitted function result means `void`. Parameters have explicit types. Local annotations may be inferred only from a clear initializer. Constants need compile-time expressions. `mut` and `self` are reserved keyword tokens, not identifiers; `mut` appears only in mutable reference/pointer and receiver forms. The standalone `_` is a special wildcard/discard token, never an identifier. Names such as `_value`, `value_`, and `__internal` are valid. No function overloading is planned.
 
 ## Primitive and composite types
 

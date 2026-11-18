@@ -30,7 +30,7 @@ This records the current proposed contract for review. It is not a v1.0 freeze. 
 | Numeric overflow | checked in all build modes; wrapping only explicit API | Debug/release differences rejected despite runtime-check cost | Designed |
 | Conversion | explicit checked `as`; panic on dynamic failure; contextual `try_as(value)` returns `Result` | Implicit lossy cast rejected; one spelling cannot hide failure | Designed |
 | Error flow | `Option`/`Result`, `match`, exact-type `?`; no exception/throw | Avoids hidden unwind and implicit error conversions | Designed |
-| Explicit discard | `let _ = expression;` is the sole explicit discard form; `_` also remains a wildcard pattern | A second `discard` statement adds redundant syntax | Designed |
+| Explicit discard/token | Lone `_` is a reserved wildcard/discard token, never an identifier; `let _ = expression;` is the sole explicit discard form and `_` is also a wildcard pattern | A second `discard` statement or treating lone `_` as a name adds ambiguity | Designed |
 | Memory | affine ownership + borrow checker + deterministic drop, no mandatory GC | Manual-only is error-prone; tracing GC has runtime/latency cost | Designed, not a safety claim |
 | Match/control | `match` statement only; bool/enums exhaustive; scalar matches need wildcard | Match expressions, block expressions and if expressions deferred to keep initial CFG simple | Designed |
 | Modules/packages | path modules; root binding for unaliased import; exact target binding for alias | No wildcard imports; no ambiguous bare import behavior | Designed |
