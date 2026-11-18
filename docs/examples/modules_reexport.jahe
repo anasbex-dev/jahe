@@ -1,0 +1,8 @@
+// Designed syntax only; module resolution and pub import are not implemented.
+module facade;
+pub import network.http;
+pub import network.http as http;
+
+func fetch(url: str) -> http.Response {
+    return http.get(url);
+}

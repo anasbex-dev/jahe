@@ -4,6 +4,6 @@ import std.io as io;
 
 func main() -> i32 {
     let greeting: str = "Hello, JAHE";
-    io::println(greeting);
+    io.println(greeting);
     return 0;
 }

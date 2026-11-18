@@ -1,0 +1,12 @@
+// Designed syntax only; tuple projection is not implemented in compiler 0.7.
+module tuple_demo;
+
+func main() -> i32 {
+    let position: (i32, i32, i32) = (10, 20, 30);
+    println(position.0);
+    println(position.1);
+    println(position.2);
+    let single: (i32,) = (7,);
+    println(single.0);
+    return 0;
+}

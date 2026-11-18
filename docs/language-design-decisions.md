@@ -1,49 +1,69 @@
-# JAHE language design decisions
+# JAHE language design decisions and status
 
-This records selected language direction, not compiler support. “Official design” is the current baseline for future implementation; “deferred” is deliberately not promised; “open” requires a later decision. Revisions should update this file and [the specification](language-specification.md) together.
+This records the current proposed contract for review. It is not a v1.0 freeze. Current compiler facts are in [language-spec.md](language-spec.md); the full design is in [language-specification.md](language-specification.md).
 
-## Selected baseline
+## Status labels
 
-| Topic | Decision | Reason / trade-off | State |
+- **Implemented:** accepted and supported by the compiler in this repository (currently the limited compiler-0.7 snapshot only).
+- **Designed:** syntax/semantics are described here but compiler support is absent.
+- **Deferred:** intentionally excluded until listed prerequisites are met.
+- **Experimental:** unstable behavior that may change before v1.0. No source-language feature is currently designated experimental; compiler internals/ABI details are not a stable language contract.
+
+## Approved core decisions
+
+| Feature | Decision | Alternative rejected / reason | Status |
 |---|---|---|---|
-| Function declaration | `func` | Distinct visual identity; clear declaration word | Official design; compiler still uses `fn` |
-| Local immutable/mutable | `let` / `var` | Mutability visible at binding site, without `let mut` modifier | Official design; compiler uses `let` / `let mut` |
-| Compile-time constant | `const` | Separate from storage-backed mutable globals | Official design; not implemented |
-| Source identity/use | `module` / `import` | Identity and dependency use are different responsibilities | Official design; compiler supports only module identity |
-| Visibility | private by default, `pub` opt-in | Reduces accidental API surface; avoids redundant `private` keyword | Official design; source visibility not implemented |
-| Types | `iN/uN`, `isize/usize`, `f32/f64`, `bool`, `char`, `void`, `never` | Width is visible; pointer-sized types are clearly target-dependent | Proposed type family; only current subset implemented |
-| Integer overflow | Checked arithmetic in every build; wrapping must be explicit | Avoids debug/release semantic drift; has runtime-check cost | Selected design baseline; cast failure details remain open |
-| Strings | `String` owned, `str` borrowed, literal static borrowed UTF-8 | Separates ownership and view semantics; no ambiguous primitive `string` | Official design; compiler has `str` only |
-| Sum branching | `match` | Supports enum exhaustiveness and destructuring, unlike integer-only switch | Official design; deferred |
-| Methods | `impl` | Groups inherent methods and trait implementations consistently | Official design; deferred |
-| Interfaces | `trait` | Supports constraints and static/dynamic dispatch vocabulary | Official design; deferred |
-| Memory safety | Affine ownership + exclusive mutable borrowing | Allows deterministic destruction without GC while retaining systems control | Proposed architecture; not a guarantee today |
-| Error handling | `Result`/`Option`, explicit matching, later `?`; no exceptions | Makes recoverable failure visible in function types | Official direction; library types not yet implemented |
-| Native FFI | Explicit `extern "C"`, unsafe call boundary | Avoids accidentally treating compiler ABI as stable | Design; source FFI deferred |
-| Module layout | `jahe.toml`, `src/path/name.jahe` | Conventional mapping, one package root, no required module line per file | Proposed; package format unresolved |
-| Generics | `<T: Constraint>`, monomorphized first | Predictable native code and no mandatory runtime dispatch | Proposed; deferred |
+| Function | `func` | `fn` retained only as current legacy compiler syntax; `func` is the JAHE spelling | Designed |
+| Bindings | immutable `let`, mutable `var`, `const` compile-time | `let mut` is current syntax only; explicit mutability at declaration is clearer | Designed |
+| Identity/import | `module` declares identity; `import` imports a dependency; `pub import` re-exports | Combining them would confuse identity with visibility | Designed |
+| Access operator | `.` for namespace, submodule, field, method, associated item, tuple index | No `::`; one chain AST leaves meaning to semantic analysis | Designed |
+| Field/method | `x.name` is field; `x.name(args)` is method call | No silent rewrite of field access into method invocation | Designed |
+| Same-name field/method | Parentheses choose method, no parentheses choose field; callable field call uses `(x.callback)()` | Avoids resolution depending on accidental callable field type | Designed |
+| Tuple projection | `tuple.0` etc.; integer position statically range-checked | Bracket form rejected because it suggests dynamic array indexing | Designed |
+| Tuple arity one | `(value,)` tuple, `(value)` grouping | Prevents grouping/tuple ambiguity; empty unit tuple omitted | Designed |
+| Re-export | `pub import path [as alias];`; visibility checked at every path boundary | Re-export cannot make private items public | Designed |
+| Import cycles | Reject all import/re-export cycles with a source-edge cycle diagnostic | Allowing declaration cycles complicates interfaces and initialization ordering | Designed |
+| Manifest/lock | human `jahe.toml`; generated deterministic `jahe.lock` | One file cannot provide both author intent and resolved reproducibility | Designed |
+| Numeric overflow | checked in all build modes; wrapping only explicit API | Debug/release differences rejected despite runtime-check cost | Designed |
+| Conversion | explicit checked `as`; panic on dynamic failure; contextual `try_as(value)` returns `Result` | Implicit lossy cast rejected; one spelling cannot hide failure | Designed |
+| Error flow | `Option`/`Result`, `match`, exact-type `?`; no exception/throw | Avoids hidden unwind and implicit error conversions | Designed |
+| Memory | affine ownership + borrow checker + deterministic drop, no mandatory GC | Manual-only is error-prone; tracing GC has runtime/latency cost | Designed, not a safety claim |
+| Match/control | `match` statement only; bool/enums exhaustive; scalar matches need wildcard | Match expressions, block expressions and if expressions deferred to keep initial CFG simple | Designed |
+| Modules/packages | path modules; root binding for unaliased import; exact target binding for alias | No wildcard imports; no ambiguous bare import behavior | Designed |
 
-## Keywords
+## Name, type, and visibility rules
 
-**Official design keywords:** `func`, `return`, `let`, `var`, `const`, `module`, `import`, `as`, `pub`, `if`, `else`, `while`, `for`, `in`, `loop`, `break`, `continue`, `match`, `struct`, `enum`, `impl`, `trait`, `unsafe`, `extern`, `true`, `false`. `self` is reserved as the explicit method receiver. `async` and `await` are reserved candidates, not enabled syntax. The current lexer accepts a smaller/different set; consult the implementation snapshot for executable source syntax.
+Type names and value/module names are separate namespaces. Type positions resolve types. Expression lookup checks innermost lexical values, module-level values/functions, and module aliases according to scope rules; an inner local may shadow an import, while same-scope conflicts are errors. If no value/module root resolves, a type name can start associated-item lookup. Qualify a type through its module to avoid a value shadow. Dotted paths rooted at modules resolve the longest existing module prefix. Member classification then uses symbol tables and expression types.
 
-`private` is rejected as redundant: omission means private. `switch` is not needed alongside `match`. `throw` is rejected because recoverable errors are values and panic is process termination. `try` is not selected; postfix `?` is the candidate propagation operator, subject to a later conversion/coherence decision. `mut` is not a binding keyword; `var` makes mutability explicit. `fn` remains a legacy compiler spelling only until a future migration; it is not the proposed canonical syntax.
+Items are private by default. `pub` exposes an item from its defining module; modules become externally nameable through `pub import` in their owner/root. Every path segment/re-export boundary is checked. Struct fields are separately public/private; enum variants inherit enum visibility; trait members follow the trait's visibility. Public signatures cannot expose unnameable private types. Re-export exposes a namespace path, not private declarations. See [module-system.md](module-system.md).
 
-## Explicit trade-offs
+## Type, generic, and callable rules
 
-- **Checked arithmetic:** safer and deterministic, but can add runtime checks. Wrapping must be explicit. The selected baseline checks in all build modes to avoid debug/release semantic drift.
-- **Private-by-default:** safer API evolution; users write `pub` for exports. It requires a deliberate re-export model later.
-- **No overloads:** simpler name resolution and diagnostics. Generics handle parametric behavior; distinct names handle distinct semantics.
-- **No exceptions:** clear no-hidden-control-flow model and simpler native ABI. `Result` can be verbose; `?` may reduce propagation boilerplate after generic constraints are defined.
-- **Affine ownership:** avoids mandatory GC and enables deterministic cleanup, but makes compiler analysis substantially harder. No safety claim is valid before the checker is sound and tested.
-- **Static dispatch first:** monomorphization simplifies runtime representation, at the cost of code size and longer builds. `dyn Trait` is explicit and later.
-- **No NUL-terminated language strings:** permits embedded NUL and length-based UTF-8 views; this differs from the runtime's current temporary print ABI.
-- **Module identity optional when path is unambiguous:** avoids repetitive headers, while explicit declarations can catch accidental path/package mismatch.
+Primitive widths, inference boundaries, conversion diagnostics, aggregate layout, generics, function pointers and closure direction are specified in [type-system.md](type-system.md). Summary: local inference only from unique initializer; no implicit conversion; exact checked casts; monomorphize generics; no specialization; orphan/coherence rule for traits; no associated types initially. Function pointers do not capture. Closures are deferred; future captures must be explicit, default move, with explicit borrow mode. Trait objects/dynamic dispatch and const generics are deferred.
 
-## Open decisions
+Struct default layout preserves field order but is compiler-private; enum tags/padding are unspecified. No aggregate crosses FFI before a future stable representation annotation. C ABI is scalar/pointer-only; bool maps through `u8`, strings are pointer/length arguments, ownership does not cross implicitly.
 
-The following are intentionally unresolved: checked conversion syntax/error type; struct packing and stable `repr(C)` guarantee; enum discriminant/layout customization; associated type and trait coherence details; exact `?` conversion behavior; closure capture defaults; `if` as expression; range endpoint semantics; atomic memory-order model; build configuration and conditional compilation; dependency registry and lockfile format; async executor model. No document should silently assume answers.
+## Memory, concurrency, and errors
 
-## Implemented syntax compatibility
+Lifetime elision is permitted only for input-only references or a unique borrow source for a reference result; otherwise named `'a` lifetimes are required. Struct partial moves are allowed only for no-destructor types; tuple/array partial moves are rejected. Drop is reverse initialization/declaration order and only `impl Drop for T` may destruct. Panic aborts with no cleanup/unwind. Interior mutability is explicit through `Cell`/`Mutex`; `Send`/`Sync` future markers enforce cross-thread safety. Atomic orderings are `Relaxed`, `Acquire`, `Release`, `AcqRel`, `SeqCst`; volatile is not synchronization and is unsafe. Threading/sync/atomics are deferred until borrow safety and runtime support.
 
-At this revision the compiler accepts `fn`, `let` with optional `mut`, and one `module` declaration. It does not parse `func`, `var`, `const`, `import`, `pub`, types beyond the subset described in [language-spec.md](language-spec.md), or most keywords above. The proposed syntax must be introduced in later implementation milestones without changing current behavior accidentally.
+`?` only propagates same-error `Result` or `Option` within a matching return type. Error conversions are explicit. C ABI never carries JAHE enums/results and never permits unwinding across boundary. Full rules in [memory-model.md](memory-model.md), [error-handling.md](error-handling.md), and [runtime-abi.md](runtime-abi.md).
+
+## Manifest and reproducibility decision
+
+`jahe.toml` declares package name, SemVer package version, language edition, source root, optional executable entry, and path/Git/registry dependencies. `jahe.lock` pins resolved versions, canonical sources, Git commit IDs, SHA-256 package/tree hashes, root manifest hash, compiler version, target/configuration, and sorted dependency edges. Resolution uses intersected SemVer requirements, one selected source/version per package name in the graph, and errors on conflicts. Git requires immutable full commit; registry archives are verified against trusted registry metadata over HTTPS; path changes invalidate lock hashes. `jahe update` changes the lock; locked builds never resolve new versions. Registry trust/key rotation, workspaces, optional features, target-specific dependency expressions, and multiple simultaneous versions are deferred. Exact manifest examples and behavior are in [module-system.md](module-system.md).
+
+## Alternatives evaluated and recommendation
+
+- **Ownership:** manual allocation gives control but increases ordinary bug burden; tracing collection simplifies reclamation but adds runtime/scheduling costs. Recommend affine ownership and borrows, with explicit unsafe; prerequisite: sound checker before claiming safety.
+- **Modules:** implicit globals and wildcard imports are concise but create name collisions. Recommend explicit imports, root/alias rules, private defaults, and no wildcards.
+- **Error handling:** exceptions add hidden control flow; conversion-heavy `?` creates coherence complexity. Recommend `Result`/`Option`, exhaustive match, and exact-type propagation.
+- **Layouts:** implicit C-compatible layout blocks optimization and is platform brittle. Recommend private native layout and explicit future ABI representations; FFI currently scalars/pointers only.
+- **Closures:** implicit capture is convenient but hides ownership/lifetime effects. Recommend defer; future explicit captures with move default.
+- **Packages:** floating versions simplify updates but damage reproducibility. Recommend semver ranges in manifest plus committed immutable lock graph and content hashes.
+
+## Deferred rather than unresolved
+
+The following are explicitly deferred, not blocking decisions for the initial language design: unions, `repr(C)` aggregates, associated types, specialization, dynamic trait objects, closures/async, block and match expressions, `if` expressions, globals/statics, manual allocators in safe code, threads/atomics/volatile, inline assembly, conditional compilation, package workspaces/features, registry trust-key lifecycle, multiple versions of a package, and non-Windows target ABIs. Each requires its listed prerequisites before implementation; no release date is promised.
+
+The design is ready for user review once the accompanying finalization report's validation passes. It must not be labeled frozen until the user explicitly approves v1.0.

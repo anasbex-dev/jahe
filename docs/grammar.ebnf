@@ -2,22 +2,23 @@
 
 compilation-unit = [ module-declaration ], { import-declaration }, { item } ;
 module-declaration = "module", module-path, ";" ;
-import-declaration = "import", module-path, [ "as", identifier ], ";" ;
+import-declaration = [ "pub" ], "import", module-path, [ "as", identifier ], ";" ;
 module-path = identifier, { ".", identifier } ;
 
 item = [ visibility ], ( function-declaration | external-function | constant-declaration
       | struct-declaration | enum-declaration | trait-declaration | impl-declaration ) ;
 visibility = "pub" ;
-function-declaration = [ "unsafe" ], "func", identifier, [ generic-parameters ],
+function-declaration = [ "const" ], [ "unsafe" ], "func", identifier, [ generic-parameters ],
                        "(", [ parameter-list ], ")", [ "->", type ], block ;
-external-function = "extern", string-literal, [ "unsafe" ], "func", identifier,
-                    [ generic-parameters ], "(", [ parameter-list ], ")",
+external-function = "extern", string-literal, "func", identifier,
+                    "(", [ parameter-list ], ")",
                     [ "->", type ], ";" ;
 parameter-list = parameter, { ",", parameter }, [ "," ] ;
 parameter = receiver | identifier, ":", type ;
-receiver = "self" | "&", [ "mut" ], "self" ;
+receiver = "self" | "&", [ lifetime ], [ "mut" ], "self" ;
 generic-parameters = "<", generic-parameter, { ",", generic-parameter }, [ "," ], ">" ;
-generic-parameter = identifier, [ ":", type-path, { "+", type-path } ] ;
+generic-parameter = lifetime | identifier, [ ":", type-path, { "+", type-path } ] ;
+lifetime = "'", identifier ;
 
 constant-declaration = "const", identifier, ":", type, "=", expression, ";" ;
 struct-declaration = "struct", identifier, [ generic-parameters ], "{",
@@ -25,23 +26,27 @@ struct-declaration = "struct", identifier, [ generic-parameters ], "{",
 field = [ visibility ], identifier, ":", type ;
 enum-declaration = "enum", identifier, [ generic-parameters ], "{",
                    [ variant, { ",", variant }, [ "," ] ], "}" ;
-variant = identifier, [ "(", type-list, ")" | "{", [ field, { ",", field }, [ "," ] ], "}" ] ;
-trait-declaration = "trait", identifier, [ generic-parameters ], [ ":", type-path, { "+", type-path } ],
-                    "{", { [ "pub" ], function-signature, ( ";" | block ) }, "}" ;
-impl-declaration = "impl", [ generic-parameters ], type, [ "for", type ],
+variant = identifier, [ "(", type-list, ")" | "{", [ enum-field, { ",", enum-field }, [ "," ] ], "}" ] ;
+enum-field = identifier, ":", type ;
+trait-declaration = [ "unsafe" ], "trait", identifier, [ generic-parameters ], [ ":", type-path, { "+", type-path } ],
+                    "{", { function-signature, ( ";" | block ) }, "}" ;
+impl-declaration = [ "unsafe" ], "impl", [ generic-parameters ], type, [ "for", type ],
                    "{", { [ visibility ], function-declaration }, "}" ;
-function-signature = [ "unsafe" ], "func", identifier, [ generic-parameters ],
+function-signature = [ "const" ], [ "unsafe" ], "func", identifier, [ generic-parameters ],
                      "(", [ parameter-list ], ")", [ "->", type ] ;
 
 type-list = type, { ",", type }, [ "," ] ;
-type = "void" | "never" | type-path | "&", [ "mut" ], type
+tuple-type-tail = type, { ",", type }, [ "," ] ;
+type = "void" | "never" | type-path | "&", [ lifetime ], [ "mut" ], type
      | "*const", type | "*mut", type
      | "[", type, ";", integer-literal, "]"
      | "[", type, "]"
-     | "(", type-list, [ "," ], ")"
-     | "func", "(", [ type-list ], ")", "->", type
+     | "(", type, ")"
+     | "(", type, ",", [ tuple-type-tail ], ")"
+     | function-type
      | type-path, "<", type-list, ">" ;
-type-path = identifier, { ( "::" | "." ), identifier } ;
+function-type = [ "extern", string-literal ], "func", "(", [ type-list ], ")", "->", type ;
+type-path = identifier, { ".", identifier } ;
 
 block = "{", { statement }, "}" ;
 statement = local-declaration | constant-declaration | return-statement | if-statement
@@ -51,15 +56,17 @@ statement = local-declaration | constant-declaration | return-statement | if-sta
 local-declaration = ( "let" | "var" ), identifier, [ ":", type ], "=", expression, ";" ;
 return-statement = "return", [ expression ], ";" ;
 if-statement = "if", expression, block, [ "else", ( block | if-statement ) ] ;
-while-statement = "while", expression, block ;
-for-statement = "for", pattern, "in", expression, block ;
-loop-statement = "loop", block ;
-break-statement = "break", [ identifier ], ";" ;
-continue-statement = "continue", [ identifier ], ";" ;
+while-statement = [ loop-label ], "while", expression, block ;
+for-statement = [ loop-label ], "for", pattern, "in", expression, block ;
+loop-statement = [ loop-label ], "loop", block ;
+loop-label = identifier, ":" ;
+break-statement = "break", [ loop-label-reference ], ";" ;
+continue-statement = "continue", [ loop-label-reference ], ";" ;
+loop-label-reference = identifier ;
 unsafe-block = "unsafe", block ;
 assignment-statement = place, assignment-operator, expression, ";" ;
 assignment-operator = "=" | "+=" | "-=" | "*=" | "/=" ;
-place = identifier, { ".", identifier | "[", expression, "]" } ;
+place = identifier, { ".", ( identifier | tuple-index ) | "[", expression, "]" } ;
 
 match-statement = "match", expression, "{", [ match-arm, { ",", match-arm }, [ "," ] ], "}" ;
 match-arm = pattern, [ "if", expression ], "=>", ( expression | block ) ;
@@ -84,21 +91,24 @@ shift = additive, { ( "<<" | ">>" ), additive } ;
 additive = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
 unary = { unary-operator }, postfix ;
-unary-operator = "!" | "-" | "~" | "&", [ "mut" ] | "*" | "unsafe" ;
-postfix = primary, { call-suffix | index-suffix | member-suffix | "?" | cast-suffix } ;
+unary-operator = "!" | "-" | "~" | "&", [ "mut" ] | "*" ;
+postfix = primary, { postfix-suffix } ;
+postfix-suffix = call-suffix | index-suffix | member-suffix | tuple-index-suffix | propagation-suffix | cast-suffix ;
 call-suffix = "(", [ argument-list ], ")" ;
 argument-list = expression, { ",", expression }, [ "," ] ;
 index-suffix = "[", expression, "]" ;
-member-suffix = ( "." | "::" ), identifier ;
+member-suffix = ".", identifier ;
+tuple-index-suffix = ".", tuple-index ;
+tuple-index = digit, { digit } ;
+propagation-suffix = "?" ;
 cast-suffix = "as", type ;
-primary = literal | identifier | "(", [ expression-list ], ")"
-        | array-literal | struct-literal | match-expression | block ;
+primary = literal | identifier | "(", expression, ")"
+        | "(", expression, ",", [ expression-list ], ")"
+        | array-literal | struct-literal ;
 expression-list = expression, { ",", expression }, [ "," ] ;
 array-literal = "[", [ expression-list ], "]" ;
 struct-literal = type-path, "{", [ field-initializer, { ",", field-initializer }, [ "," ] ], "}" ;
 field-initializer = identifier, ":", expression ;
-match-expression = "match", expression, "{", [ match-arm, { ",", match-arm }, [ "," ] ], "}" ;
-
 literal = integer-literal | float-literal | string-literal | character-literal | "true" | "false" ;
 identifier = letter-or-underscore, { letter-or-underscore | digit } ;
 integer-literal = digit, { digit | "_" } ;
@@ -106,5 +116,11 @@ float-literal = digit, { digit | "_" }, ".", digit, { digit | "_" } ;
 string-literal = '"', { string-character | escape }, '"' ;
 character-literal = "'", ( string-character | escape ), "'" ;
 escape = "\\", ( "n" | "r" | "t" | "0" | "\\" | "'" | '"' | "u{", hex-digit, { hex-digit }, "}" ) ;
+(* A block is a statement; block expressions are deferred and are not in this grammar. *)
+(* Tuple types and expressions distinguish (T)/(x) grouping from (T,)/(x,) one-element tuples. Empty tuple/unit is not in this baseline. *)
+(* Unsafe syntax is only an unsafe block or an unsafe function modifier, never a unary operator. *)
+(* Repeated postfix suffixes bind left-to-right, enabling chained calls, indexing, and member access. *)
+(* Match is statement-only; expression-valued match, if expressions, and block expressions are deferred. *)
+(* A tuple index is a dot followed by a decimal integer token; a float literal such as 10.0 remains one token. *)
 (* Whitespace and // line comments may occur between tokens. Literal decoding is UTF-8. A character-literal contains exactly one Unicode scalar. *)
 (* Lexical classes letter-or-underscore, digit, hex-digit, string-character are conventional. *)

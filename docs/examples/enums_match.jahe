@@ -5,8 +5,8 @@ enum Event { Quit, Key(u32), Resize { width: u32, height: u32 } }
 
 func describe(event: Event) -> i32 {
     match event {
-        Event::Quit => { return 0; },
-        Event::Key(code) => { return code as i32; },
-        Event::Resize { width, height } => { return (width + height) as i32; },
+        Event.Quit => { return 0; },
+        Event.Key(code) => { return code as i32; },
+        Event.Resize { width, height } => { return (width + height) as i32; },
     }
 }
