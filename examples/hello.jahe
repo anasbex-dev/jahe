@@ -1,6 +1,6 @@
 module hello;
 
-fn main() -> i32 {
+func main() -> i32 {
     let message: str = "Hello from JAHE!";
     println(message);
     return 0;

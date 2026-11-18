@@ -1,29 +1,30 @@
-# JAHE compiler 0.7 accepted syntax snapshot
+# JAHE compiler implementation snapshot
 
-This page records what the current bootstrap frontend accepts. It is deliberately separate from the designed future language in [language-specification.md](language-specification.md). This is not the full design grammar.
+This page describes the source subset currently accepted by the bootstrap compiler. It is intentionally distinct from the complete design contract in [language-specification.md](language-specification.md). JAHE 0.8 remains partial; see the [0.8 implementation report](compiler-0.8-implementation-report.md).
 
-## Current accepted forms
+## Accepted syntax
 
-Each source file contains one module declaration and functions using `fn`:
+Each file has one `module` declaration and functions use canonical `func` syntax:
 
 ```jahe
 module hello;
-fn add(a: i32, b: i32) -> i32 { return a + b; }
-fn main() -> i32 { println(add(20, 22)); return 0; }
+const BASE: i32 = 40;
+func add(a: i32, b: i32) -> i32 { return a + b; }
+func main() -> i32 {
+    let answer = add(BASE, 2);
+    println(answer);
+    return 0;
+}
 ```
 
-The supported source types are `i32`, `i64`, `f32`, `f64`, `bool`, `str`, and `void`. Function arguments and return types are explicit; omitted return type means `void`. Functions can call and recurse by declared name. Function overloading is rejected.
+The frontend also has an explicit `--legacy-syntax` mode for the 0.7 `fn` and `let mut` forms. Canonical mode rejects those forms. Function parameters require types; omitted return type means `void`. Function signatures are collected before body analysis, so forward calls work. Overloading is not supported.
 
-Statements include `let name: Type = expression;`, `let mut name: Type = expression;`, assignment to mutable locals, `return` with optional value, expression statements, nested blocks, `if`/`else`, and `while`. Declarations require initializers. Blocks create lexical scopes; nested scopes can shadow outer names, while same-scope duplicates are errors. There is no `var`, `const`, `import`, or source visibility syntax.
+Bindings use `let` for immutable locals and `var` for mutable locals. Initializers are required. An annotation can be omitted when the initializer uniquely determines one of the currently supported types: `i32`, `i64`, `f32`, `f64`, `bool`, or `str`. `const` declarations require explicit types and supported compile-time scalar expressions. `void` cannot be stored in a local. Lexical scopes, shadowing, same-scope duplicate checks, and mutability checks are retained.
 
-Expressions include identifiers, integer/float/string/bool literals, parentheses, calls, `+ - * /`, and comparisons `== != < <= > >=`. There are no unary operators or logical operators in the current parser. Numeric binary operands must have matching supported types; no implicit conversion occurs. Integer literals infer `i32` when possible, otherwise `i64`; floats infer `f64`. Strings support `\\n`, `\\t`, `\\r`, `\\"`, and `\\\\`. `//` comments are accepted. Identifiers use ASCII letters/underscore and digits after the first character.
+Expressions include names, integer/float/string/bool literals, calls, parentheses, unary integer/float negation, `+ - * / %`, integer `& | ^ << >>`, comparisons `== != < <= > >=`, and `as` casts among `i32`, `i64`, `f32`, and `f64`. Numeric literals support valid `_` digit separators. Integer tokens are currently limited to `i64`; floats default to `f64`. Signed `i32`/`i64` arithmetic, shifts, and represented casts are checked. Generic dot-member and tuple-projection syntax are represented in the AST, with semantic diagnostics marking them outside the current scalar subset. See the implementation report for precise limits.
 
-`println` accepts one supported value and returns void. Semantic analysis checks declarations, names, argument counts/types, operators, assignments, conditions, and returns. Non-void functions require a return on all modeled paths; while loops are not assumed to execute.
+Statements include local/constant declarations, assignment to local names, expression statements, nested blocks, `return`, `if`/`else`, and `while`. `println` accepts one supported scalar value and returns `void`. Checked arithmetic and native/interpreter parity cover only the signed integer IR types and operators currently represented, not the complete 0.8 scalar contract.
 
-## Backend behavior
+## Backends
 
-The typed verified IR supports SSA values, functions/calls, constants, arithmetic/comparisons, phi nodes, branches and returns. The interpreter remains available. Native compilation uses Cranelift on Windows x86_64 and the runtime ABI described by [runtime-abi.md](runtime-abi.md). Native builds require `fn main() -> i32`; generated code supports only the native subset documented in [backend-design.md](backend-design.md).
-
-## Not accepted today
-
-The proposed canonical `func`, `var`, `const`, `import`, `pub`, struct/enum/trait/generic syntax, `for`/`loop`/`match`, references, pointers, ownership, unsafe blocks, source FFI, `Option`/`Result`, and standard-library modules are designed or deferred only. They must not be presented as implemented.
+The interpreter and typed verified IR remain available. Native compilation uses Cranelift on Windows x86_64 and the existing runtime ABI. Native builds require MSVC Build Tools (`cl.exe` and `link.exe`) and emit COFF objects and executables. Unsupported lowering is diagnosed. The full primitive set, conversions, checked arithmetic, and member resolution are not implemented.

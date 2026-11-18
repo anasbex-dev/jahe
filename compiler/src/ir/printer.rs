@@ -52,6 +52,9 @@ pub fn format(module: &Module) -> String {
                     InstructionKind::Binary { op, left, right } => {
                         let _ = writeln!(o, "{} %{}, %{}", op, left.id.0, right.id.0);
                     }
+                    InstructionKind::Cast { value, target } => {
+                        let _ = writeln!(o, "cast %{} to {target}", value.id.0);
+                    }
                     InstructionKind::Call { function, args } => {
                         let a = args
                             .iter()

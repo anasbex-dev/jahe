@@ -1,7 +1,7 @@
 module loops;
 
-fn main() -> i32 {
-    let mut counter: i32 = 0;
+func main() -> i32 {
+    var counter: i32 = 0;
     while counter < 3 {
         println(counter);
         counter = counter + 1;

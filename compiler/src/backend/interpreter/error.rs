@@ -8,6 +8,8 @@ pub enum RuntimeErrorKind {
     InvalidValue,
     DivisionByZero,
     IntegerOverflow,
+    InvalidCast,
+    InvalidShift,
     StepLimitExceeded,
     CallDepthExceeded,
     InvalidControlFlow,

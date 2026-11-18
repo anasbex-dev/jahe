@@ -27,7 +27,8 @@ fn native_object_links_and_runs_with_calls_branches_loops_and_arithmetic() {
             }
         }
     "#;
-    let module = frontend::lower_to_ir(source).unwrap();
+    let module =
+        frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap();
     let verified = ir::verify::Verifier.verify(&module).unwrap();
     let root = std::env::temp_dir().join(format!("jahe_native_test_{}", std::process::id()));
     fs::create_dir_all(&root).unwrap();
@@ -41,7 +42,13 @@ fn native_object_links_and_runs_with_calls_branches_loops_and_arithmetic() {
     assert!(executable.is_file(), "MSVC executable was not emitted");
 
     let output = Command::new(&executable).output().unwrap();
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {:?}; stderr: {:?}",
+        output.stdout,
+        output.stderr
+    );
     assert_eq!(
         String::from_utf8(output.stdout)
             .unwrap()
@@ -52,9 +59,103 @@ fn native_object_links_and_runs_with_calls_branches_loops_and_arithmetic() {
 
 #[test]
 #[cfg(all(windows, target_arch = "x86_64"))]
+fn canonical_08_source_builds_and_runs_as_native_executable() {
+    let source = r#"
+        module canonical_native;
+        const BASE: i32 = 40;
+        func add(a: i32, b: i32) -> i32 { return a + b; }
+        func main() -> i32 {
+            let answer = add(BASE, 2);
+            println(answer);
+            println(17 % 5);
+            println((3.9 as i32));
+            let float_value = 7 as f64;
+            println(float_value as i32);
+            println((1 << 3) | (16 >> 2));
+            println(-2147483648);
+            return 0;
+        }
+    "#;
+    let module = frontend::lower_to_ir(source).unwrap();
+    let verified = ir::verify::Verifier.verify(&module).unwrap();
+    let root = std::env::temp_dir().join(format!("jahe_canonical_native_{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let object = root.join("canonical_native.obj");
+    let executable = root.join("canonical_native.exe");
+
+    NativeBackend::default()
+        .build_executable(&verified, &object, &executable)
+        .unwrap();
+    assert!(object.is_file(), "COFF object was not emitted");
+    assert!(executable.is_file(), "MSVC executable was not emitted");
+    let output = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {:?}; stderr: {:?}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "42\n2\n3\n7\n12\n-2147483648\n"
+    );
+}
+
+#[test]
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn native_out_of_range_cast_traps() {
+    let source = r#"module native_cast_trap;
+        func narrow(value: i64) -> i32 { return value as i32; }
+        func main() -> i32 { return narrow(2147483648); }
+    "#;
+    let module = frontend::lower_to_ir(source).unwrap();
+    let verified = ir::verify::Verifier.verify(&module).unwrap();
+    let root = std::env::temp_dir().join(format!("jahe_native_cast_trap_{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let object = root.join("native_cast_trap.obj");
+    let executable = root.join("native_cast_trap.exe");
+    NativeBackend::default()
+        .build_executable(&verified, &object, &executable)
+        .unwrap();
+    let output = Command::new(executable).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "out-of-range native cast did not trap"
+    );
+}
+
+#[test]
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn native_invalid_shift_count_traps() {
+    let root = std::env::temp_dir().join(format!("jahe_native_shift_trap_{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    for (name, expression) in [("bad_count", "1 << 32"), ("overflow", "1073741824 << 1")] {
+        let source =
+            format!("module native_shift_trap; func main() -> i32 {{ return {expression}; }}");
+        let module = frontend::lower_to_ir(&source).unwrap();
+        let verified = ir::verify::Verifier.verify(&module).unwrap();
+        let object = root.join(format!("{name}.obj"));
+        let executable = root.join(format!("{name}.exe"));
+        NativeBackend::default()
+            .build_executable(&verified, &object, &executable)
+            .unwrap();
+        let output = Command::new(executable).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "native shift case `{name}` did not trap"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn native_backend_rejects_unbound_external_functions_with_diagnostic() {
     let source = "module m; fn main() -> i32 { println(1); return 0; }";
-    let mut module = frontend::lower_to_ir(source).unwrap();
+    let mut module =
+        frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap();
     let call = module.functions[0].blocks[0]
         .instructions
         .iter_mut()
@@ -88,7 +189,8 @@ fn native_runtime_exports_each_typed_print_entry() {
             println(true); println("runtime"); return 0;
         }
     "#;
-    let mut module = frontend::lower_to_ir(source).unwrap();
+    let mut module =
+        frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap();
     let function = module
         .functions
         .iter_mut()

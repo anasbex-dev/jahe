@@ -207,20 +207,62 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                     check_use(right, b.id, i, &defs, &dom, e);
                     let cmp = !matches!(
                         op,
-                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::Div
+                            | BinaryOp::Rem
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::ShiftLeft
+                            | BinaryOp::ShiftRight
                     );
                     let numeric = matches!(left.ty, Type::I32 | Type::I64 | Type::F32 | Type::F64);
                     let comparable = matches!(
                         left.ty,
                         Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::Str
                     );
-                    let valid = left.ty == right.ty && if cmp { comparable } else { numeric };
+                    let integer_only = matches!(
+                        op,
+                        BinaryOp::Rem
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::ShiftLeft
+                            | BinaryOp::ShiftRight
+                    );
+                    let remainder_valid = !integer_only || matches!(left.ty, Type::I32 | Type::I64);
+                    let valid = left.ty == right.ty
+                        && if cmp {
+                            comparable
+                        } else {
+                            numeric && remainder_valid
+                        };
                     let result = if cmp { Type::Bool } else { left.ty };
                     if !valid || inst.result.as_ref().is_none_or(|v| v.ty != result) {
                         err(
                             e,
                             "IR0014",
                             "binary instruction has incompatible operands or result type",
+                            inst.span,
+                        );
+                    }
+                }
+                InstructionKind::Cast { value, target } => {
+                    check_use(value, b.id, i, &defs, &dom, e);
+                    let numeric = |ty| matches!(ty, Type::I32 | Type::I64 | Type::F32 | Type::F64);
+                    if !numeric(value.ty)
+                        || !numeric(*target)
+                        || inst
+                            .result
+                            .as_ref()
+                            .is_none_or(|result| result.ty != *target)
+                    {
+                        err(
+                            e,
+                            "IR0044",
+                            "cast has invalid source or target type",
                             inst.span,
                         );
                     }

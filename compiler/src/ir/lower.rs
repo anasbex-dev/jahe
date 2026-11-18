@@ -12,7 +12,8 @@ use crate::{
 use std::collections::HashMap;
 
 pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
-    let sem = semantic::analyze(ast);
+    let mut resolved = ast.clone();
+    let sem = semantic::resolve(&mut resolved);
     if !sem.is_empty() {
         return Err(sem
             .into_iter()
@@ -23,6 +24,7 @@ pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
             })
             .collect());
     }
+    let ast = &resolved;
     let sigs = ast
         .functions
         .iter()
@@ -38,10 +40,17 @@ pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
         })
         .collect::<Vec<_>>();
     let mut errs = Vec::new();
+    let constants = ast
+        .constants
+        .iter()
+        .filter_map(|c| {
+            eval_constant(&c.value).map(|value| (c.name.clone(), (map_ty(&c.ty.0), value)))
+        })
+        .collect::<HashMap<_, _>>();
     let functions = ast
         .functions
         .iter()
-        .map(|f| FunctionLowerer::new(f, &sigs, &mut errs).lower())
+        .map(|f| FunctionLowerer::new(f, &sigs, &constants, &mut errs).lower())
         .collect();
     if !errs.is_empty() {
         return Err(errs);
@@ -81,6 +90,12 @@ fn op(s: &str) -> BinaryOp {
         "-" => BinaryOp::Sub,
         "*" => BinaryOp::Mul,
         "/" => BinaryOp::Div,
+        "%" => BinaryOp::Rem,
+        "&" => BinaryOp::BitAnd,
+        "|" => BinaryOp::BitOr,
+        "^" => BinaryOp::BitXor,
+        "<<" => BinaryOp::ShiftLeft,
+        ">>" => BinaryOp::ShiftRight,
         "==" => BinaryOp::Equal,
         "!=" => BinaryOp::NotEqual,
         "<" => BinaryOp::Less,
@@ -90,6 +105,9 @@ fn op(s: &str) -> BinaryOp {
         _ => unreachable!(),
     }
 }
+fn eval_constant(expr: &Expr) -> Option<Constant> {
+    semantic::eval_const_expression(expr)
+}
 #[derive(Clone)]
 struct Binding {
     value: Value,
@@ -98,6 +116,7 @@ struct Binding {
 struct FunctionLowerer<'a> {
     ast: &'a AstFunction,
     signatures: &'a [(String, Vec<Type>, Type)],
+    constants: &'a HashMap<String, (Type, Constant)>,
     errors: &'a mut Vec<Diagnostic>,
     blocks: Vec<BasicBlock>,
     current: Option<usize>,
@@ -109,6 +128,7 @@ impl<'a> FunctionLowerer<'a> {
     fn new(
         ast: &'a AstFunction,
         sigs: &'a [(String, Vec<Type>, Type)],
+        constants: &'a HashMap<String, (Type, Constant)>,
         errors: &'a mut Vec<Diagnostic>,
     ) -> Self {
         let ret = ast
@@ -126,6 +146,7 @@ impl<'a> FunctionLowerer<'a> {
         let mut x = Self {
             ast,
             signatures: sigs,
+            constants,
             errors,
             blocks: vec![entry],
             current: Some(0),
@@ -246,6 +267,7 @@ impl<'a> FunctionLowerer<'a> {
         if self.current.is_none() {
             let span = match s {
                 AstStatement::Let { span, .. }
+                | AstStatement::Const(crate::parser::ast::Constant { span, .. })
                 | AstStatement::Assign { span, .. }
                 | AstStatement::Return(_, span)
                 | AstStatement::Expression(_, span)
@@ -267,20 +289,45 @@ impl<'a> FunctionLowerer<'a> {
                 value,
                 mutable,
                 span,
+                ..
             } => {
-                if let Some(v) = self.expr(value) {
-                    let ty = map_ty(&ty.0);
+                let expected = ty.as_ref().map(|ty| map_ty(&ty.0));
+                if let Some(v) = self.expr_expected(value, expected) {
                     let b = Binding {
-                        value: Value { ty, ..v },
+                        value: v,
                         mutable: *mutable,
                     };
                     self.scopes.last_mut().unwrap().insert(name.clone(), b);
                     let _ = span;
                 }
             }
+            AstStatement::Const(c) => {
+                if let Some(constant) = eval_constant(&c.value) {
+                    let ty = map_ty(&c.ty.0);
+                    if let Some(v) =
+                        self.emit(InstructionKind::Constant(constant), Some(ty), c.span)
+                    {
+                        self.scopes.last_mut().unwrap().insert(
+                            c.name.clone(),
+                            Binding {
+                                value: v,
+                                mutable: false,
+                            },
+                        );
+                    }
+                } else {
+                    self.errors.push(Diagnostic {
+                        code: "E0701",
+                        message: "constant expression could not be evaluated at compile time"
+                            .into(),
+                        span: c.value.span,
+                    });
+                }
+            }
             AstStatement::Assign { name, value, .. } => {
-                let rhs = self.expr(value);
-                if let (Some(rhs), Some(binding)) = (rhs, self.binding(name)) {
+                let binding = self.binding(name);
+                let rhs = self.expr_expected(value, binding.as_ref().map(|b| b.value.ty));
+                if let (Some(rhs), Some(binding)) = (rhs, binding) {
                     if !binding.mutable {
                         self.errors.push(Diagnostic {
                             code: "E0204",
@@ -298,7 +345,9 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
             AstStatement::Return(e, _) => {
-                let v = e.as_ref().and_then(|e| self.expr(e));
+                let v = e
+                    .as_ref()
+                    .and_then(|e| self.expr_expected(e, Some(self.ret)));
                 self.terminate(Terminator::Return(v));
             }
             AstStatement::Expression(e, _) => {
@@ -331,7 +380,7 @@ impl<'a> FunctionLowerer<'a> {
         else_body: &[AstStatement],
         span: Span,
     ) {
-        let Some(cond) = self.expr(condition) else {
+        let Some(cond) = self.expr_expected(condition, Some(Type::Bool)) else {
             return;
         };
         let pre = self.current.unwrap();
@@ -489,7 +538,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
         }
-        let Some(cond) = self.expr(condition) else {
+        let Some(cond) = self.expr_expected(condition, Some(Type::Bool)) else {
             return;
         };
         let cond_block = self.current.unwrap();
@@ -534,15 +583,25 @@ impl<'a> FunctionLowerer<'a> {
         self.scopes = header_env;
     }
     fn expr(&mut self, e: &Expr) -> Option<Value> {
+        self.expr_expected(e, None)
+    }
+    fn expr_expected(&mut self, e: &Expr, expected: Option<Type>) -> Option<Value> {
         let span = e.span;
         match &e.kind {
-            ExprKind::Name(n) => self.binding(n).map(|b| b.value),
+            ExprKind::Name(n) => self.binding(n).map(|b| b.value).or_else(|| {
+                self.constants.get(n).cloned().and_then(|(ty, value)| {
+                    self.emit(InstructionKind::Constant(value), Some(ty), span)
+                })
+            }),
             ExprKind::Integer(v) => {
-                let t = if i32::try_from(*v).is_ok() {
+                let inferred = if i32::try_from(*v).is_ok() {
                     Type::I32
                 } else {
                     Type::I64
                 };
+                let t = expected
+                    .filter(|t| matches!(t, Type::I32 | Type::I64))
+                    .unwrap_or(inferred);
                 self.emit(
                     InstructionKind::Constant(Constant::Integer(*v)),
                     Some(t),
@@ -551,7 +610,11 @@ impl<'a> FunctionLowerer<'a> {
             }
             ExprKind::Float(v) => self.emit(
                 InstructionKind::Constant(Constant::Float(*v)),
-                Some(Type::F64),
+                Some(
+                    expected
+                        .filter(|t| matches!(t, Type::F32 | Type::F64))
+                        .unwrap_or(Type::F64),
+                ),
                 span,
             ),
             ExprKind::String(v) => self.emit(
@@ -569,13 +632,10 @@ impl<'a> FunctionLowerer<'a> {
                 op: oper,
                 right,
             } => {
-                let l = self.expr(left)?;
-                let r = self.expr(right)?;
-                let ty = if ["==", "!=", "<", "<=", ">", ">="].contains(&oper.as_str()) {
-                    Type::Bool
-                } else {
-                    l.ty
-                };
+                let comparison = ["==", "!=", "<", "<=", ">", ">="].contains(&oper.as_str());
+                let l = self.expr_expected(left, if comparison { None } else { expected })?;
+                let r = self.expr_expected(right, Some(l.ty))?;
+                let ty = if comparison { Type::Bool } else { l.ty };
                 self.emit(
                     InstructionKind::Binary {
                         op: op(oper),
@@ -587,24 +647,121 @@ impl<'a> FunctionLowerer<'a> {
                 )
             }
             ExprKind::Call { callee, args } => {
+                let ExprKind::Name(function) = &callee.kind else {
+                    self.errors.push(Diagnostic {
+                        code: "E0810",
+                        message: "unresolved member call cannot be lowered in scalar 0.8".into(),
+                        span,
+                    });
+                    return None;
+                };
+                let signature = self.signatures.iter().find(|s| s.0 == *function).cloned();
                 let values = args
                     .iter()
-                    .map(|a| self.expr(a))
+                    .enumerate()
+                    .map(|(i, a)| {
+                        self.expr_expected(a, signature.as_ref().and_then(|s| s.1.get(i).copied()))
+                    })
                     .collect::<Option<Vec<_>>>()?;
-                let ret = self
-                    .signatures
-                    .iter()
-                    .find(|s| s.0 == *callee)
-                    .map(|s| s.2)
-                    .unwrap_or(Type::Void);
+                let ret = signature.map(|s| s.2).unwrap_or(Type::Void);
                 self.emit(
                     InstructionKind::Call {
-                        function: callee.clone(),
+                        function: function.clone(),
                         args: values,
                     },
                     if ret == Type::Void { None } else { Some(ret) },
                     span,
                 )
+            }
+            ExprKind::Member { member, .. } => {
+                self.errors.push(Diagnostic {
+                    code: "E0810",
+                    message: format!("member `{member}` has no scalar resolution in compiler 0.8"),
+                    span,
+                });
+                None
+            }
+            ExprKind::TupleIndex { index, .. } => {
+                self.errors.push(Diagnostic {
+                    code: "E0810",
+                    message: format!(
+                        "tuple projection .{index} is not implemented in compiler 0.8"
+                    ),
+                    span,
+                });
+                None
+            }
+            ExprKind::Cast { value, target } => {
+                let source = self.expr_expected(value, None)?;
+                let target = map_ty(&target.0);
+                self.emit(
+                    InstructionKind::Cast {
+                        value: source,
+                        target,
+                    },
+                    Some(target),
+                    span,
+                )
+            }
+            ExprKind::Unary { op: unary, value } if unary == "-" => {
+                if let ExprKind::Integer(magnitude) = value.kind {
+                    let Some(negative) = magnitude.checked_neg() else {
+                        self.errors.push(Diagnostic {
+                            code: "E0811",
+                            message: "negative integer literal is outside the supported range"
+                                .into(),
+                            span,
+                        });
+                        return None;
+                    };
+                    let inferred = if i32::try_from(negative).is_ok() {
+                        Type::I32
+                    } else {
+                        Type::I64
+                    };
+                    let ty = expected
+                        .filter(|ty| matches!(ty, Type::I32 | Type::I64))
+                        .unwrap_or(inferred);
+                    return self.emit(
+                        InstructionKind::Constant(Constant::Integer(negative)),
+                        Some(ty),
+                        span,
+                    );
+                }
+                let Some(value) = self.expr_expected(value, expected) else {
+                    return None;
+                };
+                if !matches!(value.ty, Type::I32 | Type::I64) {
+                    self.errors.push(Diagnostic {
+                        code: "E0811",
+                        message: "floating unary negation lowering is not implemented".into(),
+                        span,
+                    });
+                    return None;
+                }
+                let zero = self.emit(
+                    InstructionKind::Constant(Constant::Integer(0)),
+                    Some(value.ty),
+                    span,
+                )?;
+                let ty = zero.ty;
+                self.emit(
+                    InstructionKind::Binary {
+                        op: BinaryOp::Sub,
+                        left: zero,
+                        right: value,
+                    },
+                    Some(ty),
+                    span,
+                )
+            }
+            ExprKind::Unary { op: unary, .. } => {
+                self.errors.push(Diagnostic {
+                    code: "E0810",
+                    message: format!("unary operator `{unary}` is not supported"),
+                    span,
+                });
+                None
             }
         }
     }

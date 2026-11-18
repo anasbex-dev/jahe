@@ -1,7 +1,7 @@
 use jahe_compiler::{frontend, semantic};
 
 fn errors(source: &str) -> Vec<semantic::SemanticDiagnostic> {
-    frontend::analyze(source).unwrap()
+    frontend::analyze_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap()
 }
 
 #[test]

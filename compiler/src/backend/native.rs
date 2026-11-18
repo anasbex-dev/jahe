@@ -444,7 +444,7 @@ fn emit_instruction(
                             .trapnz(overflow, cranelift_codegen::ir::TrapCode::unwrap_user(2));
                         value
                     }
-                    Div if left.ty != Type::Bool => {
+                    Div | Rem if left.ty != Type::Bool => {
                         let zero = builder.ins().iconst(clif_type(left.ty, pointer_type)?, 0);
                         let is_zero = builder.ins().icmp(IntCC::Equal, rhs, zero);
                         builder
@@ -465,7 +465,41 @@ fn emit_instruction(
                         builder
                             .ins()
                             .trapnz(overflow, cranelift_codegen::ir::TrapCode::unwrap_user(2));
-                        builder.ins().sdiv(lhs, rhs)
+                        if *op == Rem {
+                            builder.ins().srem(lhs, rhs)
+                        } else {
+                            builder.ins().sdiv(lhs, rhs)
+                        }
+                    }
+                    BitAnd if left.ty != Type::Bool => builder.ins().band(lhs, rhs),
+                    BitOr if left.ty != Type::Bool => builder.ins().bor(lhs, rhs),
+                    BitXor if left.ty != Type::Bool => builder.ins().bxor(lhs, rhs),
+                    ShiftLeft | ShiftRight if left.ty != Type::Bool => {
+                        let ty = clif_type(left.ty, pointer_type)?;
+                        let width = if left.ty == Type::I32 { 32 } else { 64 };
+                        let zero = builder.ins().iconst(ty, 0);
+                        let upper = builder.ins().iconst(ty, width);
+                        let negative = builder.ins().icmp(IntCC::SignedLessThan, rhs, zero);
+                        let too_large =
+                            builder
+                                .ins()
+                                .icmp(IntCC::SignedGreaterThanOrEqual, rhs, upper);
+                        let invalid_count = builder.ins().bor(negative, too_large);
+                        builder.ins().trapnz(
+                            invalid_count,
+                            cranelift_codegen::ir::TrapCode::unwrap_user(5),
+                        );
+                        if *op == ShiftRight {
+                            builder.ins().sshr(lhs, rhs)
+                        } else {
+                            let shifted = builder.ins().ishl(lhs, rhs);
+                            let restored = builder.ins().sshr(shifted, rhs);
+                            let overflow = builder.ins().icmp(IntCC::NotEqual, restored, lhs);
+                            builder
+                                .ins()
+                                .trapnz(overflow, cranelift_codegen::ir::TrapCode::unwrap_user(2));
+                            shifted
+                        }
                     }
                     Equal => builder.ins().icmp(IntCC::Equal, lhs, rhs),
                     NotEqual => builder.ins().icmp(IntCC::NotEqual, lhs, rhs),
@@ -475,9 +509,20 @@ fn emit_instruction(
                     GreaterEqual => builder
                         .ins()
                         .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs),
-                    Div => return Err(unsupported(inst.span, "division is not defined for bool")),
+                    Div | Rem => {
+                        return Err(unsupported(
+                            inst.span,
+                            "division/remainder is not defined for bool",
+                        ))
+                    }
                     Add | Sub | Mul => {
                         return Err(unsupported(inst.span, "arithmetic is not defined for bool"))
+                    }
+                    BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => {
+                        return Err(unsupported(
+                            inst.span,
+                            "bitwise operations are not defined for bool",
+                        ))
                     }
                 },
                 Type::F32 | Type::F64 => match op {
@@ -485,6 +530,18 @@ fn emit_instruction(
                     Sub => builder.ins().fsub(lhs, rhs),
                     Mul => builder.ins().fmul(lhs, rhs),
                     Div => builder.ins().fdiv(lhs, rhs),
+                    Rem => {
+                        return Err(unsupported(
+                            inst.span,
+                            "remainder is defined only for integers",
+                        ))
+                    }
+                    BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => {
+                        return Err(unsupported(
+                            inst.span,
+                            "bitwise and shift operations require integers",
+                        ))
+                    }
                     Equal => builder.ins().fcmp(FloatCC::Equal, lhs, rhs),
                     NotEqual => builder.ins().fcmp(FloatCC::NotEqual, lhs, rhs),
                     Less => builder.ins().fcmp(FloatCC::LessThan, lhs, rhs),
@@ -503,6 +560,17 @@ fn emit_instruction(
                 }
             };
             Ok(Some(result))
+        }
+        InstructionKind::Cast { value, target } => {
+            let source = val(value)?;
+            Ok(Some(native_cast(
+                builder,
+                source,
+                value.ty,
+                *target,
+                inst.span,
+                pointer_type,
+            )?))
         }
         InstructionKind::Call {
             function: name,
@@ -540,6 +608,85 @@ fn emit_instruction(
             Ok(result)
         }
     }
+}
+
+fn native_cast(
+    builder: &mut FunctionBuilder<'_>,
+    value: ClifValue,
+    source: Type,
+    target: Type,
+    span: crate::lexer::token::Span,
+    pointer_type: cranelift_codegen::ir::Type,
+) -> Result<ClifValue, BackendError> {
+    use Type::*;
+    let source_integer = matches!(source, I32 | I64);
+    let target_integer = matches!(target, I32 | I64);
+    let source_float = matches!(source, F32 | F64);
+    let target_float = matches!(target, F32 | F64);
+    let result = match (source_integer, source_float, target_integer, target_float) {
+        (true, false, true, false) if source == target => value,
+        (true, false, true, false) if source == I32 && target == I64 => {
+            builder.ins().sextend(types::I64, value)
+        }
+        (true, false, true, false) if source == I64 && target == I32 => {
+            let narrowed = builder.ins().ireduce(types::I32, value);
+            let restored = builder.ins().sextend(types::I64, narrowed);
+            let valid = builder.ins().icmp(IntCC::Equal, restored, value);
+            let invalid = builder.ins().bnot(valid);
+            builder
+                .ins()
+                .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
+            narrowed
+        }
+        (true, false, false, true) => builder
+            .ins()
+            .fcvt_from_sint(clif_type(target, pointer_type)?, value),
+        (false, true, true, false) => {
+            let float64 = if source == F32 {
+                builder.ins().fpromote(types::F64, value)
+            } else {
+                value
+            };
+            let min = if target == I32 {
+                i32::MIN as f64
+            } else {
+                -9_223_372_036_854_775_808.0
+            };
+            let upper = if target == I32 {
+                2_147_483_648.0
+            } else {
+                9_223_372_036_854_775_808.0
+            };
+            let lower_bound = builder.ins().f64const(min);
+            let upper_bound = builder.ins().f64const(upper);
+            let below = builder.ins().fcmp(FloatCC::LessThan, float64, lower_bound);
+            let above = builder
+                .ins()
+                .fcmp(FloatCC::GreaterThanOrEqual, float64, upper_bound);
+            let unordered = builder.ins().fcmp(FloatCC::Unordered, float64, float64);
+            let out_of_range = builder.ins().bor(below, above);
+            let invalid = builder.ins().bor(out_of_range, unordered);
+            builder
+                .ins()
+                .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
+            builder
+                .ins()
+                .fcvt_to_sint(clif_type(target, pointer_type)?, float64)
+        }
+        (false, true, false, true) if source == F32 && target == F64 => {
+            builder.ins().fpromote(types::F64, value)
+        }
+        (false, true, false, true) if source == F64 && target == F32 => {
+            builder.ins().fdemote(types::F32, value)
+        }
+        _ => {
+            return Err(unsupported(
+                span,
+                format!("cast from `{source}` to `{target}` is unsupported"),
+            ))
+        }
+    };
+    Ok(result)
 }
 
 fn edge_values(

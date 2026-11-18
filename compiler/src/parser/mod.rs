@@ -8,24 +8,42 @@ use crate::{
 };
 use ast::*;
 
-pub fn parse(source: &str) -> Result<Module, Diagnostic> {
-    let tokens = Lexer::new(source).tokenize()?;
-    Parser { tokens, current: 0 }.module()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyntaxMode {
+    #[default]
+    Canonical,
+    Legacy,
 }
+
+pub fn parse(source: &str) -> Result<Module, Diagnostic> {
+    parse_with_mode(source, SyntaxMode::Canonical)
+}
+
+pub fn parse_with_mode(source: &str, mode: SyntaxMode) -> Result<Module, Diagnostic> {
+    let tokens = Lexer::new(source).tokenize()?;
+    Parser {
+        tokens,
+        current: 0,
+        mode,
+    }
+    .module()
+}
+
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    mode: SyntaxMode,
 }
 impl Parser {
     fn peek(&self) -> &Token {
         &self.tokens[self.current]
     }
     fn advance(&mut self) -> Token {
-        let t = self.peek().clone();
-        if !matches!(t.kind, TokenKind::Eof) {
+        let token = self.peek().clone();
+        if !matches!(token.kind, TokenKind::Eof) {
             self.current += 1;
         }
-        t
+        token
     }
     fn at(&self, kind: &TokenKind) -> bool {
         match (&self.peek().kind, kind) {
@@ -51,10 +69,10 @@ impl Parser {
     fn identifier(&mut self, message: &str) -> Result<String, Diagnostic> {
         match self.advance() {
             Token {
-                kind: TokenKind::Identifier(v),
+                kind: TokenKind::Identifier(value),
                 ..
-            } => Ok(v),
-            t => Err(Diagnostic::new(message, t.span)),
+            } => Ok(value),
+            token => Err(Diagnostic::new(message, token.span)),
         }
     }
     fn module(mut self) -> Result<Module, Diagnostic> {
@@ -67,19 +85,40 @@ impl Parser {
             TokenKind::Semicolon,
             "expected ';' after module declaration",
         )?;
+        let mut constants = Vec::new();
         let mut functions = Vec::new();
         while !self.at(&TokenKind::Eof) {
-            functions.push(self.function()?);
+            if self.at(&TokenKind::Keyword(Keyword::Const)) {
+                constants.push(self.constant()?);
+            } else {
+                functions.push(self.function()?);
+            }
         }
-        Ok(Module { name, functions })
+        Ok(Module {
+            name,
+            constants,
+            functions,
+        })
     }
     fn function(&mut self) -> Result<Function, Diagnostic> {
-        let span = self
-            .expect(
-                TokenKind::Keyword(Keyword::Fn),
-                "expected function declaration",
-            )?
-            .span;
+        let token = self.advance();
+        let span = token.span;
+        match token.kind {
+            TokenKind::Keyword(Keyword::Func) => {}
+            TokenKind::Keyword(Keyword::Fn) if self.mode == SyntaxMode::Legacy => {}
+            TokenKind::Keyword(Keyword::Fn) => {
+                return Err(Diagnostic::new(
+                    "legacy `fn` syntax requires --legacy-syntax; use `func` in JAHE 0.8",
+                    span,
+                ))
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    "expected function declaration starting with `func`",
+                    span,
+                ))
+            }
+        }
         let name = self.identifier("expected function name")?;
         self.expect(TokenKind::LeftParen, "expected '(' after function name")?;
         let mut params = Vec::new();
@@ -94,6 +133,9 @@ impl Parser {
                     ty: self.ty()?,
                 });
                 if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.at(&TokenKind::RightParen) {
                     break;
                 }
             }
@@ -111,6 +153,24 @@ impl Parser {
             params,
             return_type,
             body,
+        })
+    }
+    fn constant(&mut self) -> Result<Constant, Diagnostic> {
+        let span = self.advance().span;
+        let name = self.identifier("expected constant name")?;
+        self.expect(TokenKind::Colon, "constant type annotation is required")?;
+        let ty = self.ty()?;
+        self.expect(TokenKind::Equal, "expected '=' in constant declaration")?;
+        let value = self.expression()?;
+        self.expect(
+            TokenKind::Semicolon,
+            "expected ';' after constant declaration",
+        )?;
+        Ok(Constant {
+            name,
+            ty,
+            value,
+            span,
         })
     }
     fn ty(&mut self) -> Result<Type, Diagnostic> {
@@ -135,12 +195,32 @@ impl Parser {
             self.expect(TokenKind::RightBrace, "expected '}' after block")?;
             return Ok(Statement::Block(body, span));
         }
-        if self.at(&TokenKind::Keyword(Keyword::Let)) {
-            let span = self.advance().span;
-            let mutable = self.eat(&TokenKind::Keyword(Keyword::Mut));
-            let name = self.identifier("expected identifier after 'let'")?;
-            self.expect(TokenKind::Colon, "expected ':' after variable name")?;
-            let ty = self.ty()?;
+        if self.at(&TokenKind::Keyword(Keyword::Const)) {
+            return self.constant().map(Statement::Const);
+        }
+        if self.at(&TokenKind::Keyword(Keyword::Let)) || self.at(&TokenKind::Keyword(Keyword::Var))
+        {
+            let declaration = self.advance();
+            let mutable = matches!(declaration.kind, TokenKind::Keyword(Keyword::Var));
+            let old_mut = self.eat(&TokenKind::Keyword(Keyword::Mut));
+            if old_mut && self.mode != SyntaxMode::Legacy {
+                return Err(Diagnostic::new(
+                    "legacy `let mut` requires --legacy-syntax; use `var`",
+                    declaration.span,
+                ));
+            }
+            if old_mut && mutable {
+                return Err(Diagnostic::new(
+                    "`var mut` is invalid; use `var name`",
+                    declaration.span,
+                ));
+            }
+            let name = self.identifier("expected identifier after binding keyword")?;
+            let ty = if self.eat(&TokenKind::Colon) {
+                Some(self.ty()?)
+            } else {
+                None
+            };
             self.expect(TokenKind::Equal, "expected '=' in variable declaration")?;
             let value = self.expression()?;
             self.expect(
@@ -151,8 +231,8 @@ impl Parser {
                 name,
                 ty,
                 value,
-                mutable,
-                span,
+                mutable: mutable || old_mut,
+                span: declaration.span,
             });
         }
         if self.at(&TokenKind::Keyword(Keyword::If)) {
@@ -195,22 +275,22 @@ impl Parser {
             self.expect(TokenKind::Semicolon, "expected ';' after return")?;
             return Ok(Statement::Return(value, span));
         }
-        if let TokenKind::Identifier(name) = self.peek().kind.clone() {
-            let span = self.peek().span;
-            if self
-                .tokens
-                .get(self.current + 1)
-                .is_some_and(|t| matches!(t.kind, TokenKind::Equal))
-            {
-                self.advance();
-                self.advance();
-                let value = self.expression()?;
-                self.expect(TokenKind::Semicolon, "expected ';' after assignment")?;
-                return Ok(Statement::Assign { name, value, span });
-            }
-        }
         let span = self.peek().span;
         let expr = self.expression()?;
+        if self.eat(&TokenKind::Equal) {
+            let name = match expr.kind {
+                ExprKind::Name(name) => name,
+                _ => {
+                    return Err(Diagnostic::new(
+                        "assignment target must be a local variable",
+                        expr.span,
+                    ))
+                }
+            };
+            let value = self.expression()?;
+            self.expect(TokenKind::Semicolon, "expected ';' after assignment")?;
+            return Ok(Statement::Assign { name, value, span });
+        }
         self.expect(TokenKind::Semicolon, "expected ';' after expression")?;
         Ok(Statement::Expression(expr, span))
     }
@@ -218,7 +298,7 @@ impl Parser {
         self.binary(0)
     }
     fn binary(&mut self, min: u8) -> Result<Expr, Diagnostic> {
-        let mut left = self.primary()?;
+        let mut left = self.postfix()?;
         loop {
             let (prec, op) = match self.peek().kind {
                 TokenKind::EqualEqual => (1, "=="),
@@ -227,10 +307,16 @@ impl Parser {
                 TokenKind::LessEqual => (1, "<="),
                 TokenKind::Greater => (1, ">"),
                 TokenKind::GreaterEqual => (1, ">="),
-                TokenKind::Plus => (2, "+"),
-                TokenKind::Minus => (2, "-"),
-                TokenKind::Star => (3, "*"),
-                TokenKind::Slash => (3, "/"),
+                TokenKind::Pipe => (2, "|"),
+                TokenKind::Caret => (3, "^"),
+                TokenKind::Ampersand => (4, "&"),
+                TokenKind::ShiftLeft => (5, "<<"),
+                TokenKind::ShiftRight => (5, ">>"),
+                TokenKind::Plus => (6, "+"),
+                TokenKind::Minus => (6, "-"),
+                TokenKind::Star => (7, "*"),
+                TokenKind::Slash => (7, "/"),
+                TokenKind::Percent => (7, "%"),
                 _ => break,
             };
             if prec < min {
@@ -250,6 +336,69 @@ impl Parser {
         }
         Ok(left)
     }
+    fn postfix(&mut self) -> Result<Expr, Diagnostic> {
+        let mut expr = self.primary()?;
+        loop {
+            if self.eat(&TokenKind::LeftParen) {
+                let mut args = Vec::new();
+                if !self.at(&TokenKind::RightParen) {
+                    loop {
+                        args.push(self.expression()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                        if self.at(&TokenKind::RightParen) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(TokenKind::RightParen, "expected ')' after arguments")?;
+                let span = expr.span;
+                expr = Expr {
+                    kind: ExprKind::Call {
+                        callee: Box::new(expr),
+                        args,
+                    },
+                    span,
+                };
+            } else if self.eat(&TokenKind::Dot) {
+                let token = self.advance();
+                let kind = match token.kind {
+                    TokenKind::Identifier(member) => ExprKind::Member {
+                        base: Box::new(expr.clone()),
+                        member,
+                    },
+                    TokenKind::Integer(index) if index >= 0 => ExprKind::TupleIndex {
+                        base: Box::new(expr.clone()),
+                        index: index as u32,
+                    },
+                    _ => {
+                        return Err(Diagnostic::new(
+                            "expected member name or tuple position after '.'",
+                            token.span,
+                        ))
+                    }
+                };
+                expr = Expr {
+                    kind,
+                    span: expr.span,
+                };
+            } else if self.eat(&TokenKind::Keyword(Keyword::As)) {
+                let target = self.ty()?;
+                let span = expr.span;
+                expr = Expr {
+                    kind: ExprKind::Cast {
+                        value: Box::new(expr),
+                        target,
+                    },
+                    span,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(expr)
+    }
     fn primary(&mut self) -> Result<Expr, Diagnostic> {
         let token = self.advance();
         let span = token.span;
@@ -259,20 +408,17 @@ impl Parser {
             TokenKind::String(v) => ExprKind::String(v),
             TokenKind::Keyword(Keyword::True) => ExprKind::Bool(true),
             TokenKind::Keyword(Keyword::False) => ExprKind::Bool(false),
-            TokenKind::Identifier(name) if self.eat(&TokenKind::LeftParen) => {
-                let mut args = Vec::new();
-                if !self.at(&TokenKind::RightParen) {
-                    loop {
-                        args.push(self.expression()?);
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                }
-                self.expect(TokenKind::RightParen, "expected ')' after arguments")?;
-                ExprKind::Call { callee: name, args }
-            }
             TokenKind::Identifier(name) => ExprKind::Name(name),
+            TokenKind::Minus => {
+                let value = self.primary()?;
+                return Ok(Expr {
+                    kind: ExprKind::Unary {
+                        op: "-".into(),
+                        value: Box::new(value),
+                    },
+                    span,
+                });
+            }
             TokenKind::LeftParen => {
                 let expr = self.expression()?;
                 self.expect(TokenKind::RightParen, "expected ')' after expression")?;

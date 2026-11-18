@@ -4,7 +4,7 @@ JAHE is an experimental compiled systems programming language inspired by C and 
 
 ## Status
 
-Compiler 0.7.0 keeps the verified, backend-neutral IR and interpreter, and adds a versioned runtime foundation alongside the Cranelift native backend for Windows x86_64. Native builds emit COFF objects and link a static `jahe-runtime` library through the MSVC toolchain. The project is experimental and not production-ready. The accepted compiler syntax is documented in [the implementation snapshot](docs/language-spec.md); the proposed complete language design is in [the language specification](docs/language-specification.md).
+Compiler 0.8 development adds canonical `func`/`let`/`var` syntax, inferred local bindings, scalar checks, numeric casts, remainder, bitwise/shift operations, and compile-time scalar constants to the existing verified IR, interpreter, and Cranelift native backend. The 0.8 milestone is still partial: see the [implementation report](docs/compiler-0.8-implementation-report.md) for the supported subset and open gaps. Native builds emit COFF objects and link the static `jahe-runtime` library through MSVC on Windows x86_64. The project is experimental and not production-ready.
 
 ## Build
 
@@ -32,7 +32,7 @@ cargo run --manifest-path compiler/Cargo.toml -- run examples/loops.jahe
 cargo run --manifest-path compiler/Cargo.toml -- build examples/arithmetic.jahe
 ```
 
-`tokens` prints the lexical stream, `ast` prints the parsed syntax tree, `check` performs parsing and semantic validation, `ir` prints validated typed IR, `run` interprets a module's `main` function, and `build` emits `examples/arithmetic.obj` and `examples/arithmetic.exe`. Native builds currently require a Windows x86_64 host and Visual Studio C++ Build Tools (including `cl.exe` and `link.exe`). An `i32 main` return in the range 0–255 becomes the process exit status when interpreted; a `void main` exits with 0. Native executable entry points must be `fn main() -> i32`. Unsupported native operations and external host functions are diagnosed instead of generating guessed code.
+`tokens` prints the lexical stream, `ast` prints the parsed syntax tree, `check` performs parsing and semantic validation, `ir` prints validated typed IR, `run` interprets a module's `main` function, and `build` emits `examples/arithmetic.obj` and `examples/arithmetic.exe`. Native builds currently require a Windows x86_64 host and Visual Studio C++ Build Tools (including `cl.exe` and `link.exe`). Use `--legacy-syntax` before the command to accept the old `fn` and `let mut` forms. An `i32 main` return in the range 0–255 becomes the process exit status when interpreted; a `void main` exits with 0. Native executable entry points must be `func main() -> i32`. Unsupported operations and external host functions are diagnosed instead of generating guessed code.
 
 ## Design philosophy
 

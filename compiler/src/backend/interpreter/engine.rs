@@ -361,6 +361,9 @@ impl Engine<'_> {
                         self.read(&frame, right)?,
                         inst.span,
                     )?),
+                    InstructionKind::Cast { value, target } => {
+                        Some(cast(self.read(&frame, value)?, *target, inst.span)?)
+                    }
                     InstructionKind::Call {
                         function: name,
                         args,
@@ -480,6 +483,58 @@ fn constant(c: &Constant, ty: Option<Type>, span: Span) -> Result<RuntimeValue, 
         )),
     }
 }
+fn cast(value: RuntimeValue, target: Type, span: Span) -> Result<RuntimeValue, RuntimeError> {
+    use RuntimeValue as V;
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorKind::InvalidCast,
+            format!("value cannot be represented as `{target}`"),
+            Some(span),
+        )
+    };
+    match (value, target) {
+        (V::I32(v), Type::I32) => Ok(V::I32(v)),
+        (V::I32(v), Type::I64) => Ok(V::I64(i64::from(v))),
+        (V::I32(v), Type::F32) => Ok(V::F32(v as f32)),
+        (V::I32(v), Type::F64) => Ok(V::F64(v as f64)),
+        (V::I64(v), Type::I32) => i32::try_from(v).map(V::I32).map_err(|_| invalid()),
+        (V::I64(v), Type::I64) => Ok(V::I64(v)),
+        (V::I64(v), Type::F32) => Ok(V::F32(v as f32)),
+        (V::I64(v), Type::F64) => Ok(V::F64(v as f64)),
+        (V::F32(v), Type::I32) => float_to_i32(f64::from(v), span).map(V::I32),
+        (V::F32(v), Type::I64) => float_to_i64(f64::from(v), span).map(V::I64),
+        (V::F32(v), Type::F32) => Ok(V::F32(v)),
+        (V::F32(v), Type::F64) => Ok(V::F64(f64::from(v))),
+        (V::F64(v), Type::I32) => float_to_i32(v, span).map(V::I32),
+        (V::F64(v), Type::I64) => float_to_i64(v, span).map(V::I64),
+        (V::F64(v), Type::F32) => Ok(V::F32(v as f32)),
+        (V::F64(v), Type::F64) => Ok(V::F64(v)),
+        _ => Err(invalid()),
+    }
+}
+fn float_to_i32(value: f64, span: Span) -> Result<i32, RuntimeError> {
+    if value.is_finite() && value >= i32::MIN as f64 && value < (i32::MAX as f64) + 1.0 {
+        Ok(value.trunc() as i32)
+    } else {
+        Err(RuntimeError::new(
+            RuntimeErrorKind::InvalidCast,
+            "float is outside the range of `i32`",
+            Some(span),
+        ))
+    }
+}
+fn float_to_i64(value: f64, span: Span) -> Result<i64, RuntimeError> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_finite() && value >= i64::MIN as f64 && value < I64_UPPER_EXCLUSIVE {
+        Ok(value.trunc() as i64)
+    } else {
+        Err(RuntimeError::new(
+            RuntimeErrorKind::InvalidCast,
+            "float is outside the range of `i64`",
+            Some(span),
+        ))
+    }
+}
 fn binary(
     op: BinaryOp,
     left: RuntimeValue,
@@ -523,6 +578,13 @@ where
     }
 }
 fn integer32(op: BinaryOp, a: i32, b: i32, s: Span) -> Result<RuntimeValue, RuntimeError> {
+    if op == BinaryOp::ShiftLeft {
+        let shifted = checked_left_shift(i64::from(a), i64::from(b), 32, s)? as i32;
+        return Ok(RuntimeValue::I32(shifted));
+    }
+    if op == BinaryOp::ShiftRight {
+        return Ok(RuntimeValue::I32(a >> valid_shift(i64::from(b), 32, s)?));
+    }
     let checked = match op {
         BinaryOp::Add => a.checked_add(b),
         BinaryOp::Sub => a.checked_sub(b),
@@ -531,11 +593,25 @@ fn integer32(op: BinaryOp, a: i32, b: i32, s: Span) -> Result<RuntimeValue, Runt
             div_zero(b, 0, s)?;
             a.checked_div(b)
         }
+        BinaryOp::Rem => {
+            div_zero(b, 0, s)?;
+            a.checked_rem(b)
+        }
+        BinaryOp::BitAnd => Some(a & b),
+        BinaryOp::BitOr => Some(a | b),
+        BinaryOp::BitXor => Some(a ^ b),
         _ => None,
     };
     if matches!(
         op,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
     ) {
         return checked.map(RuntimeValue::I32).ok_or_else(|| {
             RuntimeError::new(
@@ -550,6 +626,12 @@ fn integer32(op: BinaryOp, a: i32, b: i32, s: Span) -> Result<RuntimeValue, Runt
         .ok_or_else(|| invalid_binary(s))
 }
 fn integer64(op: BinaryOp, a: i64, b: i64, s: Span) -> Result<RuntimeValue, RuntimeError> {
+    if op == BinaryOp::ShiftLeft {
+        return checked_left_shift(a, b, 64, s).map(RuntimeValue::I64);
+    }
+    if op == BinaryOp::ShiftRight {
+        return Ok(RuntimeValue::I64(a >> valid_shift(b, 64, s)?));
+    }
     let checked = match op {
         BinaryOp::Add => a.checked_add(b),
         BinaryOp::Sub => a.checked_sub(b),
@@ -558,11 +640,25 @@ fn integer64(op: BinaryOp, a: i64, b: i64, s: Span) -> Result<RuntimeValue, Runt
             div_zero(b, 0, s)?;
             a.checked_div(b)
         }
+        BinaryOp::Rem => {
+            div_zero(b, 0, s)?;
+            a.checked_rem(b)
+        }
+        BinaryOp::BitAnd => Some(a & b),
+        BinaryOp::BitOr => Some(a | b),
+        BinaryOp::BitXor => Some(a ^ b),
         _ => None,
     };
     if matches!(
         op,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
     ) {
         return checked.map(RuntimeValue::I64).ok_or_else(|| {
             RuntimeError::new(
@@ -586,6 +682,47 @@ fn compare(op: BinaryOp, o: std::cmp::Ordering) -> Option<bool> {
         BinaryOp::GreaterEqual => !o.is_lt(),
         _ => return None,
     })
+}
+fn valid_shift(count: i64, width: u32, span: Span) -> Result<u32, RuntimeError> {
+    u32::try_from(count)
+        .ok()
+        .filter(|count| *count < width)
+        .ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorKind::InvalidShift,
+                format!("shift count must be between 0 and {}", width - 1),
+                Some(span),
+            )
+        })
+}
+fn checked_left_shift(value: i64, count: i64, width: u32, span: Span) -> Result<i64, RuntimeError> {
+    let count = valid_shift(count, width, span)?;
+    let shifted = if width == 32 {
+        i64::from((value as i32).wrapping_shl(count))
+    } else {
+        value.wrapping_shl(count)
+    };
+    if width == 32 {
+        if ((shifted as i32) >> count) == value as i32 {
+            Ok(shifted)
+        } else {
+            Err(RuntimeError::new(
+                RuntimeErrorKind::IntegerOverflow,
+                "i32 left shift overflow",
+                Some(span),
+            ))
+        }
+    } else {
+        if (shifted >> count) == value {
+            Ok(shifted)
+        } else {
+            Err(RuntimeError::new(
+                RuntimeErrorKind::IntegerOverflow,
+                "i64 left shift overflow",
+                Some(span),
+            ))
+        }
+    }
 }
 fn float32(op: BinaryOp, a: f32, b: f32, s: Span) -> Result<RuntimeValue, RuntimeError> {
     use RuntimeValue::F32;

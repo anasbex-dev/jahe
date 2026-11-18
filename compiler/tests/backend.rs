@@ -13,7 +13,7 @@ use jahe_compiler::{
 };
 
 fn compile(source: &str) -> ir::Module {
-    frontend::lower_to_ir(source).unwrap()
+    frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap()
 }
 fn run(source: &str) -> jahe_compiler::backend::interpreter::ExecutionResult {
     Interpreter::default().execute(&compile(source)).unwrap()
@@ -44,6 +44,107 @@ fn end_to_end_examples_cover_arithmetic_calls_branches_and_loops() {
     assert_eq!(branches.return_value, Some(RuntimeValue::I32(10)));
     let loops = run(include_str!("../../examples/loops.jahe"));
     assert_eq!(loops.output, "0\n1\n2\n");
+}
+
+#[test]
+fn canonical_08_syntax_runs_with_inferred_locals_and_const_values() {
+    let source = r#"
+        module canonical;
+        const ANSWER: i32 = 40 + 2;
+        func add(a: i32, b: i32) -> i32 { return a + b; }
+        func main() -> i32 {
+            let base = 40;
+            var value = add(base, 2);
+            value = value + 1;
+            println(ANSWER);
+            return value - 43;
+        }
+    "#;
+    let module = frontend::lower_to_ir(source).unwrap();
+    let result = Interpreter::default().execute(&module).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(0)));
+    assert_eq!(result.output, "42\n");
+}
+
+#[test]
+fn integer_remainder_runs_in_interpreter() {
+    let module =
+        frontend::lower_to_ir("module remainder; func main() -> i32 { return 17 % 5; }").unwrap();
+    let result = Interpreter::default().execute(&module).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(2)));
+
+    let by_zero =
+        frontend::lower_to_ir("module remainder; func main() -> i32 { return 17 % 0; }").unwrap();
+    let error = Interpreter::default().execute(&by_zero).unwrap_err();
+    assert!(error.to_string().contains("division by zero"));
+
+    let signed_overflow = frontend::lower_to_ir(
+        "module remainder; func main() -> i32 { return (-2147483648) % -1; }",
+    )
+    .unwrap();
+    assert!(Interpreter::default().execute(&signed_overflow).is_err());
+}
+
+#[test]
+fn explicit_numeric_casts_run_and_reject_out_of_range_values() {
+    let source = r#"module casts; func main() -> i32 {
+        let wide = 100 as i64;
+        let precise = wide as f64;
+        let truncated = (precise + 3.9) as i32;
+        const THREE: i32 = 3.9 as i32;
+        return truncated + THREE;
+    }"#;
+    let module = frontend::lower_to_ir(source).unwrap();
+    let result = Interpreter::default().execute(&module).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(106)));
+
+    let invalid = frontend::lower_to_ir(
+        "module casts; func main() -> i32 { let wide = 2147483648 as i64; return wide as i32; }",
+    )
+    .unwrap();
+    let error = Interpreter::default().execute(&invalid).unwrap_err();
+    assert_eq!(error.kind, BackendErrorKind::Runtime);
+    assert!(error.to_string().contains("cannot be represented"));
+
+    let compile_time_invalid = frontend::lower_to_ir(
+        "module casts; func main() -> i32 { let value = 2147483648 as i32; return value; }",
+    )
+    .unwrap_err();
+    assert!(compile_time_invalid
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0304"));
+}
+
+#[test]
+fn integer_bitwise_and_shift_operations_run_with_checked_counts() {
+    let source = "module bits; func main() -> i32 { let value = (1 << 3) | (16 >> 2); return value + (6 & 3) + (1 ^ 3); }";
+    let module = frontend::lower_to_ir(source).unwrap();
+    let result = Interpreter::default().execute(&module).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(16)));
+
+    let invalid =
+        frontend::lower_to_ir("module bits; func main() -> i32 { return 1 << 32; }").unwrap();
+    let error = Interpreter::default().execute(&invalid).unwrap_err();
+    assert!(error.to_string().contains("shift count must be between"));
+
+    let overflow =
+        frontend::lower_to_ir("module bits; func main() -> i32 { return 1073741824 << 1; }")
+            .unwrap();
+    assert!(Interpreter::default().execute(&overflow).is_err());
+
+    let signed_right =
+        frontend::lower_to_ir("module bits; func main() -> i32 { return -8 >> 2; }").unwrap();
+    let result = Interpreter::default().execute(&signed_right).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(-2)));
+}
+
+#[test]
+fn signed_i32_minimum_literal_is_representable() {
+    let module =
+        frontend::lower_to_ir("module min_value; func main() -> i32 { return -2147483648; }")
+            .unwrap();
+    let result = Interpreter::default().execute(&module).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(i32::MIN)));
 }
 
 #[test]

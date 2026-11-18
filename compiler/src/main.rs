@@ -8,15 +8,28 @@ use jahe_compiler::{
     diagnostics::{render, render_ir},
     frontend,
     lexer::Lexer,
+    parser::SyntaxMode,
     VERSION,
 };
 
 fn usage() {
-    eprintln!("usage: jahe [--version] <check|tokens|ast|ir|run|build> <file> | runtime-info");
+    eprintln!(
+        "usage: jahe [--legacy-syntax] <check|tokens|ast|ir|run|build> <file> | runtime-info"
+    );
 }
 
 fn run() -> Result<i32, String> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    let legacy = raw_args.iter().any(|arg| arg == "--legacy-syntax");
+    let args = raw_args
+        .into_iter()
+        .filter(|arg| arg != "--legacy-syntax")
+        .collect::<Vec<_>>();
+    let syntax_mode = if legacy {
+        SyntaxMode::Legacy
+    } else {
+        SyntaxMode::Canonical
+    };
     if args.as_slice() == ["--version"] || args.as_slice() == ["-V"] {
         println!("jahe {VERSION}");
         return Ok(0);
@@ -49,11 +62,11 @@ fn run() -> Result<i32, String> {
             }
             Err(error) => return Err(render(filename, &source, &error)),
         },
-        "ast" => match frontend::parse(&source) {
+        "ast" => match frontend::parse_with_mode(&source, syntax_mode) {
             Ok(module) => println!("{module:#?}"),
             Err(error) => return Err(render(filename, &source, &error)),
         },
-        "check" => match frontend::analyze(&source) {
+        "check" => match frontend::analyze_with_mode(&source, syntax_mode) {
             Ok(errors) if errors.is_empty() => println!("{}: semantic checks passed", filename),
             Ok(errors) => {
                 return Err(errors
@@ -64,7 +77,7 @@ fn run() -> Result<i32, String> {
             }
             Err(error) => return Err(render(filename, &source, &error)),
         },
-        "ir" => match frontend::lower_to_ir(&source) {
+        "ir" => match frontend::lower_to_ir_with_mode(&source, syntax_mode) {
             Ok(module) => {
                 let verified = jahe_compiler::ir::verify::Verifier
                     .verify(&module)
@@ -86,13 +99,14 @@ fn run() -> Result<i32, String> {
             }
         },
         "run" => {
-            let module = frontend::lower_to_ir(&source).map_err(|errors| {
-                errors
-                    .iter()
-                    .map(|e| render_ir(filename, &source, e))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            let module =
+                frontend::lower_to_ir_with_mode(&source, syntax_mode).map_err(|errors| {
+                    errors
+                        .iter()
+                        .map(|e| render_ir(filename, &source, e))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })?;
             let interpreter = Interpreter::default();
             let verified = jahe_compiler::ir::verify::Verifier
                 .verify(&module)
@@ -142,13 +156,14 @@ fn run() -> Result<i32, String> {
             }
         }
         "build" => {
-            let module = frontend::lower_to_ir(&source).map_err(|errors| {
-                errors
-                    .iter()
-                    .map(|e| render_ir(filename, &source, e))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })?;
+            let module =
+                frontend::lower_to_ir_with_mode(&source, syntax_mode).map_err(|errors| {
+                    errors
+                        .iter()
+                        .map(|e| render_ir(filename, &source, e))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })?;
             let verified = jahe_compiler::ir::verify::Verifier
                 .verify(&module)
                 .map_err(|errors| {

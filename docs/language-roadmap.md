@@ -1,11 +1,11 @@
 # JAHE language implementation roadmap
 
-This is a proposed order, not a schedule or a promise that a feature is ready to implement. The present task completes specification design for review; it does not change compiler behavior. No phase may claim a feature implemented until parser, semantic analysis, IR/backend support where relevant, diagnostics and tests are completed.
+This is a proposed order, not a schedule or a promise that a feature is ready to implement. Compiler 0.8 work has started and is partial; the current subset and remaining blockers are recorded in [the implementation report](compiler-0.8-implementation-report.md). No phase may claim a feature implemented until parser, semantic analysis, IR/backend support where relevant, diagnostics and tests are completed.
 
 | Phase | Scope | Prerequisites / exit criteria |
 |---|---|---|
-| Specification closure (current) | Define language syntax/semantics; record remaining extension topics and the status distinction | User review. Do not label v1.0 frozen without explicit approval. |
-| 0.8 — Core syntax and scalar semantics | Add `func`/`var`/`const` syntax with compatibility policy; numeric primitives/literals/conversions; generic dot-member AST and semantic resolution scaffolding | Lexer/parser/AST and diagnostics first; test legacy syntax policy, inference, overflow and casts; no aggregate types required. |
+| Specification closure (approved) | Define language syntax/semantics; record remaining extension topics and the status distinction | v1.0 was approved; maintain it as the design contract. |
+| 0.8 — Core syntax and scalar semantics (partial) | Canonical syntax, local inference, scalar semantic scaffolding, const subset, generic dot-member AST, legacy opt-in | Finish full primitive/literal range, casts, checked arithmetic, backend/interpreter parity, member-resolution scaffolding and corresponding tests. |
 | 0.9 — Aggregates and patterns | Structs, tuples including `.0`, arrays, enums, field/method distinction foundations, `match` statement and exhaustiveness | Target layouts and aggregate IR before backend lowering; static tuple bounds; enum exhaustiveness and guarded arms. |
 | 0.10 — Ownership and unsafe | Move/copy analysis, references/lifetimes, borrow checker, partial moves, drop scopes/destructors, raw pointers/unsafe | Soundness gates in memory-model.md; cannot claim safety from syntax-only checks. |
 | 0.11 — Generics and value errors | Generic functions/types, traits needed for constraints, monomorphization, function pointer types, Option/Result, exact `?` | Type/layout recursion guard and coherence first; exhaustive match already exists; same-type error propagation. |

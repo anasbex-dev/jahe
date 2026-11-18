@@ -1,10 +1,10 @@
 module functions;
 
-fn add(left: i32, right: i32) -> i32 {
+func add(left: i32, right: i32) -> i32 {
     return left + right;
 }
 
-fn main() -> i32 {
+func main() -> i32 {
     println(add(3, 4));
     return 0;
 }

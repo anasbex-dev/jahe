@@ -3,7 +3,15 @@ use crate::lexer::token::Span;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub name: String,
+    pub constants: Vec<Constant>,
     pub functions: Vec<Function>,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constant {
+    pub name: String,
+    pub ty: Type,
+    pub value: Expr,
+    pub span: Span,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
@@ -25,11 +33,12 @@ pub struct Type(pub String);
 pub enum Statement {
     Let {
         name: String,
-        ty: Type,
+        ty: Option<Type>,
         value: Expr,
         mutable: bool,
         span: Span,
     },
+    Const(Constant),
     Assign {
         name: String,
         value: Expr,
@@ -63,8 +72,24 @@ pub enum ExprKind {
     String(String),
     Bool(bool),
     Call {
-        callee: String,
+        callee: Box<Expr>,
         args: Vec<Expr>,
+    },
+    Member {
+        base: Box<Expr>,
+        member: String,
+    },
+    TupleIndex {
+        base: Box<Expr>,
+        index: u32,
+    },
+    Cast {
+        value: Box<Expr>,
+        target: Type,
+    },
+    Unary {
+        op: String,
+        value: Box<Expr>,
     },
     Binary {
         left: Box<Expr>,

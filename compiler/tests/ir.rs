@@ -4,7 +4,7 @@ use jahe_compiler::{
 };
 
 fn lower(source: &str) -> ir::Module {
-    frontend::lower_to_ir(source).unwrap()
+    frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap()
 }
 
 #[test]
@@ -78,12 +78,23 @@ fn lowers_constant_kinds_and_prints_backend_neutral_text() {
 
 #[test]
 fn refuses_semantically_invalid_or_unlowerable_programs() {
-    let mismatch = frontend::lower_to_ir("module m; fn f() -> i32 { return true; }").unwrap_err();
+    let mismatch = frontend::lower_to_ir_with_mode(
+        "module m; fn f() -> i32 { return true; }",
+        jahe_compiler::parser::SyntaxMode::Legacy,
+    )
+    .unwrap_err();
     assert!(!mismatch.is_empty());
-    let missing_return = frontend::lower_to_ir("module m; fn f() -> i32 { }").unwrap_err();
+    let missing_return = frontend::lower_to_ir_with_mode(
+        "module m; fn f() -> i32 { }",
+        jahe_compiler::parser::SyntaxMode::Legacy,
+    )
+    .unwrap_err();
     assert!(missing_return.iter().any(|e| e.code == "E0601"));
-    let unreachable =
-        frontend::lower_to_ir("module m; fn f() { return; println(1); }").unwrap_err();
+    let unreachable = frontend::lower_to_ir_with_mode(
+        "module m; fn f() { return; println(1); }",
+        jahe_compiler::parser::SyntaxMode::Legacy,
+    )
+    .unwrap_err();
     assert!(unreachable.iter().any(|e| e.code == "E0602"));
 }
 
@@ -189,9 +200,11 @@ fn lowers_while_to_loop_header_phi_and_checks_return_paths() {
         .iter()
         .any(|b| matches!(b.terminator, Some(Terminator::ConditionalBranch { .. }))));
 
-    let missing =
-        frontend::lower_to_ir("module m; fn maybe(flag: bool) -> i32 { if flag { return 1; } }")
-            .unwrap_err();
+    let missing = frontend::lower_to_ir_with_mode(
+        "module m; fn maybe(flag: bool) -> i32 { if flag { return 1; } }",
+        jahe_compiler::parser::SyntaxMode::Legacy,
+    )
+    .unwrap_err();
     assert!(missing.iter().any(|e| e.code == "E0601"));
     let complete =
         lower("module m; fn both(flag: bool) -> i32 { if flag { return 1; } else { return 0; } }");
@@ -387,8 +400,10 @@ fn validator_rejects_non_dominating_values_and_nonreturning_loop_exit_paths() {
         .iter()
         .any(|e| e.code == "IR0026"));
 
-    let errors =
-        frontend::lower_to_ir("module m; fn only_loops() -> i32 { while true { return 1; } }")
-            .unwrap_err();
+    let errors = frontend::lower_to_ir_with_mode(
+        "module m; fn only_loops() -> i32 { while true { return 1; } }",
+        jahe_compiler::parser::SyntaxMode::Legacy,
+    )
+    .unwrap_err();
     assert!(errors.iter().any(|e| e.code == "E0601"));
 }
