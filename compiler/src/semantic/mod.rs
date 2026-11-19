@@ -2,7 +2,7 @@ use crate::{
     lexer::token::Span,
     parser::ast::{Constant, Expr, ExprKind, Function, Module, Statement, Type},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDiagnostic {
@@ -35,24 +35,48 @@ impl SemanticDiagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
+    I8,
+    I16,
     I32,
     I64,
+    I128,
+    ISize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    USize,
     F32,
     F64,
     Bool,
+    Char,
     Str,
     Void,
+    Never,
 }
 impl Ty {
     fn parse(t: &Type) -> Option<Self> {
         match t.0.as_str() {
+            "i8" => Some(Self::I8),
+            "i16" => Some(Self::I16),
             "i32" => Some(Self::I32),
             "i64" => Some(Self::I64),
+            "i128" => Some(Self::I128),
+            "isize" => Some(Self::ISize),
+            "u8" => Some(Self::U8),
+            "u16" => Some(Self::U16),
+            "u32" => Some(Self::U32),
+            "u64" => Some(Self::U64),
+            "u128" => Some(Self::U128),
+            "usize" => Some(Self::USize),
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
             "bool" => Some(Self::Bool),
+            "char" => Some(Self::Char),
             "str" => Some(Self::Str),
             "void" => Some(Self::Void),
+            "never" => Some(Self::Never),
             _ => None,
         }
     }
@@ -60,13 +84,61 @@ impl Ty {
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::I8 => "i8",
+            Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::I128 => "i128",
+            Self::ISize => "isize",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::U128 => "u128",
+            Self::USize => "usize",
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Bool => "bool",
+            Self::Char => "char",
             Self::Str => "str",
             Self::Void => "void",
+            Self::Never => "never",
+        })
+    }
+}
+impl Ty {
+    fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::I128
+                | Self::ISize
+                | Self::U8
+                | Self::U16
+                | Self::U32
+                | Self::U64
+                | Self::U128
+                | Self::USize
+        )
+    }
+    fn is_signed_integer(self) -> bool {
+        matches!(
+            self,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128 | Self::ISize
+        )
+    }
+    fn integer_width(self, pointer_width: u8) -> Option<u32> {
+        Some(match self {
+            Self::I8 | Self::U8 => 8,
+            Self::I16 | Self::U16 => 16,
+            Self::I32 | Self::U32 => 32,
+            Self::I64 | Self::U64 => 64,
+            Self::ISize | Self::USize => u32::from(pointer_width),
+            Self::I128 | Self::U128 => 128,
+            _ => return None,
         })
     }
 }
@@ -79,6 +151,7 @@ struct Signature {
 struct Variable {
     ty: Ty,
     mutable: bool,
+    constant: Option<crate::ir::Constant>,
 }
 
 pub fn analyze(module: &Module) -> Vec<SemanticDiagnostic> {
@@ -88,10 +161,19 @@ pub fn analyze(module: &Module) -> Vec<SemanticDiagnostic> {
 
 /// Resolves inferred local types in-place before lowering. This keeps type decisions out of the parser and IR backend.
 pub fn resolve(module: &mut Module) -> Vec<SemanticDiagnostic> {
+    resolve_for_target(module, crate::target::TargetSpec::WINDOWS_X86_64_MSVC)
+}
+
+pub fn resolve_for_target(
+    module: &mut Module,
+    target: crate::target::TargetSpec,
+) -> Vec<SemanticDiagnostic> {
     let mut checker = Checker {
         functions: HashMap::new(),
         constants: HashMap::new(),
+        constant_values: HashMap::new(),
         errors: Vec::new(),
+        target,
     };
     for constant in &module.constants {
         if checker.constants.contains_key(&constant.name) {
@@ -128,18 +210,31 @@ pub fn resolve(module: &mut Module) -> Vec<SemanticDiagnostic> {
             .functions
             .insert(function.name.clone(), Signature { params, result });
     }
+    let cycles = constant_cycles(&module.constants);
     for constant in &module.constants {
         let expected = Ty::parse(&constant.ty).unwrap_or(Ty::Void);
         let actual = checker.expression(&constant.value, &[], Some(expected));
         checker.expect(expected, actual, constant.value.span);
-        if !is_const_expr(&constant.value) {
+        if cycles.contains(&constant.name) {
+            checker.errors.push(SemanticDiagnostic::new(
+                "E0702",
+                format!(
+                    "constant `{}` participates in a dependency cycle",
+                    constant.name
+                ),
+                constant.span,
+            ));
+        } else if let Some(value) =
+            eval_const_expression_with(&constant.value, &checker.constant_values)
+        {
+            check_const_value(&value, expected, constant.value.span, &mut checker.errors);
+            checker.constant_values.insert(constant.name.clone(), value);
+        } else {
             checker.errors.push(SemanticDiagnostic::new(
                 "E0701",
-                "constant initializer must be a compile-time constant expression",
+                "constant initializer could not be evaluated; it may contain an unsupported operation or a forward reference",
                 constant.value.span,
             ));
-        } else {
-            check_const_range(&constant.value, expected, &mut checker.errors);
         }
     }
     for function in &mut module.functions {
@@ -151,7 +246,9 @@ pub fn resolve(module: &mut Module) -> Vec<SemanticDiagnostic> {
 struct Checker {
     functions: HashMap<String, Signature>,
     constants: HashMap<String, Ty>,
+    constant_values: HashMap<String, crate::ir::Constant>,
     errors: Vec<SemanticDiagnostic>,
+    target: crate::target::TargetSpec,
 }
 impl Checker {
     fn resolve_type(&mut self, t: &Type, span: Span) -> Ty {
@@ -177,8 +274,22 @@ impl Checker {
                     p.span,
                 ));
             }
+            if ty == Ty::Never {
+                self.errors.push(SemanticDiagnostic::new(
+                    "E0102",
+                    "parameter cannot have type `never`",
+                    p.span,
+                ));
+            }
             if scopes[0]
-                .insert(p.name.clone(), Variable { ty, mutable: false })
+                .insert(
+                    p.name.clone(),
+                    Variable {
+                        ty,
+                        mutable: false,
+                        constant: None,
+                    },
+                )
                 .is_some()
             {
                 self.errors.push(SemanticDiagnostic::new(
@@ -191,7 +302,7 @@ impl Checker {
         for stmt in &mut f.body {
             self.statement(stmt, &mut scopes, sig.result);
         }
-        if sig.result != Ty::Void && !returns_on_all_paths(&f.body) {
+        if sig.result != Ty::Void && !self.block_terminates(&f.body) {
             self.errors.push(SemanticDiagnostic::new(
                 "E0601",
                 format!(
@@ -224,7 +335,21 @@ impl Checker {
                         *span,
                     ));
                 }
+                if expected == Some(Ty::Never) {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0102",
+                        "variable cannot have type `never`",
+                        *span,
+                    ));
+                }
                 let actual = self.expression(value, scopes, expected);
+                if actual == Ty::Never && expected.is_none() {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0102",
+                        "cannot infer a stored value from a diverging expression",
+                        value.span,
+                    ));
+                }
                 if let Some(expected) = expected {
                     self.expect(expected, actual, value.span);
                 } else {
@@ -243,6 +368,7 @@ impl Checker {
                         Variable {
                             ty: actual,
                             mutable: *mutable,
+                            constant: None,
                         },
                     );
                 }
@@ -304,14 +430,23 @@ impl Checker {
         let expected = self.resolve_type(&c.ty, c.span);
         let actual = self.expression(&c.value, scopes, Some(expected));
         self.expect(expected, actual, c.value.span);
-        if !is_const_expr(&c.value) {
+        let mut const_env = self.constant_values.clone();
+        for scope in scopes.iter() {
+            for (name, variable) in scope {
+                if let Some(value) = &variable.constant {
+                    const_env.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        let evaluated = eval_const_expression_with(&c.value, &const_env);
+        if let Some(value) = &evaluated {
+            check_const_value(value, expected, c.value.span, &mut self.errors);
+        } else {
             self.errors.push(SemanticDiagnostic::new(
                 "E0701",
-                "constant initializer must be a compile-time constant expression",
+                "constant initializer could not be evaluated at compile time",
                 c.value.span,
             ));
-        } else {
-            check_const_range(&c.value, expected, &mut self.errors);
         }
         let scope = scopes.last_mut().unwrap();
         if scope.contains_key(&c.name) {
@@ -326,6 +461,7 @@ impl Checker {
                 Variable {
                     ty: expected,
                     mutable: false,
+                    constant: evaluated,
                 },
             );
         }
@@ -343,9 +479,62 @@ impl Checker {
         scopes.pop();
     }
     fn expect(&mut self, e: Ty, a: Ty, span: Span) {
-        if e != a {
+        if e != a && a != Ty::Never {
             self.errors.push(SemanticDiagnostic::mismatch(span, e, a));
         }
+    }
+    fn expression_terminates(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                args.iter().any(|arg| self.expression_terminates(arg))
+                    || match &callee.kind {
+                        ExprKind::Name(name) => self
+                            .functions
+                            .get(name)
+                            .is_some_and(|sig| sig.result == Ty::Never),
+                        _ => self.expression_terminates(callee),
+                    }
+            }
+            ExprKind::Cast { value, .. } | ExprKind::Unary { value, .. } => {
+                self.expression_terminates(value)
+            }
+            ExprKind::Binary { left, op, right } if op == "&&" || op == "||" => {
+                self.expression_terminates(left)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expression_terminates(left) || self.expression_terminates(right)
+            }
+            _ => false,
+        }
+    }
+    fn block_terminates(&self, body: &[Statement]) -> bool {
+        body.iter().any(|statement| match statement {
+            Statement::Return(_, _) => true,
+            Statement::Block(nested, _) => self.block_terminates(nested),
+            Statement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                !else_body.is_empty()
+                    && self.block_terminates(then_body)
+                    && self.block_terminates(else_body)
+            }
+            Statement::While {
+                condition:
+                    Expr {
+                        kind: ExprKind::Bool(true),
+                        ..
+                    },
+                ..
+            } => true,
+            Statement::Let { value, .. } | Statement::Expression(value, _) => {
+                self.expression_terminates(value)
+            }
+            Statement::Assign { value, .. } => self.expression_terminates(value),
+            Statement::Const(c) => self.expression_terminates(&c.value),
+            Statement::While { .. } => false,
+        })
     }
     fn expression(
         &mut self,
@@ -368,27 +557,63 @@ impl Checker {
                     Ty::Void
                 }),
             ExprKind::Integer(v) => {
-                let inferred = if i32::try_from(*v).is_ok() {
-                    Ty::I32
-                } else {
-                    Ty::I64
+                let Some(magnitude) = v.magnitude() else {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0305",
+                        format!("integer literal `{}` is outside the supported range", v.raw),
+                        e.span,
+                    ));
+                    return Ty::I64;
                 };
-                match expected {
-                    Some(Ty::I32) if i32::try_from(*v).is_err() => {
+                let inferred = if magnitude <= i32::MAX as u128 {
+                    Ty::I32
+                } else if magnitude <= i64::MAX as u128 {
+                    Ty::I64
+                } else if magnitude <= i128::MAX as u128 {
+                    Ty::I128
+                } else {
+                    Ty::U128
+                };
+                if let Some(expected) = expected.filter(|t| t.is_integer()) {
+                    let width = expected
+                        .integer_width(self.target.pointer_width)
+                        .unwrap_or(64);
+                    let max = integer_positive_max(expected.is_signed_integer(), width);
+                    if magnitude > max {
                         self.errors.push(SemanticDiagnostic::new(
                             "E0305",
-                            format!("integer literal `{v}` is outside the range of `i32`"),
+                            format!(
+                                "integer literal `{}` is outside the range of `{expected}`",
+                                v.raw
+                            ),
                             e.span,
                         ));
+                    }
+                    expected
+                } else if expected.is_some() {
+                    let fallback = if magnitude <= i32::MAX as u128 {
                         Ty::I32
-                    }
-                    Some(t @ (Ty::I32 | Ty::I64)) => t,
-                    Some(t) => {
-                        self.errors
-                            .push(SemanticDiagnostic::mismatch(e.span, t, inferred));
+                    } else {
                         inferred
-                    }
-                    None => inferred,
+                    };
+                    self.errors.push(SemanticDiagnostic::mismatch(
+                        e.span,
+                        expected.unwrap(),
+                        fallback,
+                    ));
+                    fallback
+                } else if inferred == Ty::U128 {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0305",
+                        format!(
+                            "integer literal `{}` requires an explicit unsigned type",
+                            v.raw
+                        ),
+                        e.span,
+                    ));
+                    Ty::U128
+                } else {
+                    inferred
                 }
             }
             ExprKind::Float(_) => match expected {
@@ -411,6 +636,12 @@ impl Checker {
                     self.expect(t, Ty::Bool, e.span);
                 }
                 Ty::Bool
+            }
+            ExprKind::Character(_) => {
+                if let Some(t) = expected {
+                    self.expect(t, Ty::Char, e.span);
+                }
+                Ty::Char
             }
             ExprKind::Call { callee, args } => {
                 let Some(name) = (match &callee.kind {
@@ -469,6 +700,16 @@ impl Checker {
                 sig.result
             }
             ExprKind::Binary { left, op, right } => {
+                if op == "&&" || op == "||" {
+                    let lhs = self.expression(left, scopes, Some(Ty::Bool));
+                    let rhs = self.expression(right, scopes, Some(Ty::Bool));
+                    self.expect(Ty::Bool, lhs, left.span);
+                    self.expect(Ty::Bool, rhs, right.span);
+                    if let Some(t) = expected {
+                        self.expect(t, Ty::Bool, e.span);
+                    }
+                    return Ty::Bool;
+                }
                 let comparison = ["==", "!=", "<", "<=", ">", ">="].contains(&op.as_str());
                 let bitwise = ["&", "|", "^", "<<", ">>"].contains(&op.as_str());
                 let l = self.expression(left, scopes, if comparison { None } else { expected });
@@ -476,11 +717,11 @@ impl Checker {
                 if comparison {
                     self.expect(l, r, right.span);
                     let valid = match op.as_str() {
-                        "==" | "!=" => matches!(
-                            l,
-                            Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Str
-                        ),
-                        _ => matches!(l, Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64),
+                        "==" | "!=" => {
+                            l.is_integer()
+                                || matches!(l, Ty::F32 | Ty::F64 | Ty::Bool | Ty::Str | Ty::Char)
+                        }
+                        _ => l.is_integer() || matches!(l, Ty::F32 | Ty::F64),
                     };
                     if !valid {
                         self.errors.push(SemanticDiagnostic::new(
@@ -492,9 +733,7 @@ impl Checker {
                     Ty::Bool
                 } else {
                     self.expect(l, r, right.span);
-                    if (!bitwise && !matches!(l, Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64))
-                        || ((op == "%" || bitwise) && !matches!(l, Ty::I32 | Ty::I64))
-                    {
+                    if (!bitwise && !is_numeric(l)) || ((op == "%" || bitwise) && !l.is_integer()) {
                         self.errors.push(SemanticDiagnostic::new(
                             "E0302",
                             format!("operator `{op}` requires compatible integer operands"),
@@ -541,10 +780,10 @@ impl Checker {
             ExprKind::Unary { op, value }
                 if op == "-" && matches!(value.kind, ExprKind::Integer(_)) =>
             {
-                let ExprKind::Integer(magnitude) = value.kind else {
+                let ExprKind::Integer(magnitude) = &value.kind else {
                     unreachable!()
                 };
-                let Some(negative) = magnitude.checked_neg() else {
+                let Some(magnitude) = magnitude.magnitude() else {
                     self.errors.push(SemanticDiagnostic::new(
                         "E0305",
                         "negative integer literal is outside the supported range",
@@ -552,17 +791,40 @@ impl Checker {
                     ));
                     return Ty::I64;
                 };
-                let inferred = if i32::try_from(negative).is_ok() {
+                let inferred = if magnitude <= (i32::MAX as u128) + 1 {
                     Ty::I32
-                } else {
+                } else if magnitude <= (i64::MAX as u128) + 1 {
                     Ty::I64
+                } else if magnitude <= (i128::MAX as u128) + 1 {
+                    Ty::I128
+                } else {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0305",
+                        "negative integer literal is outside the range of every signed integer type",
+                        e.span,
+                    ));
+                    return Ty::I128;
                 };
+                let inferred_width = inferred.integer_width(self.target.pointer_width).unwrap();
+                let max_magnitude = integer_positive_max(true, inferred_width) + 1;
+                if magnitude > max_magnitude {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0305",
+                        "negative integer literal is outside the supported range",
+                        e.span,
+                    ));
+                    return inferred;
+                }
                 match expected {
-                    Some(t @ (Ty::I32 | Ty::I64)) => {
-                        if t == Ty::I32 && i32::try_from(negative).is_err() {
+                    Some(t) if t.is_signed_integer() => {
+                        let expected_max = integer_positive_max(
+                            true,
+                            t.integer_width(self.target.pointer_width).unwrap(),
+                        ) + 1;
+                        if magnitude > expected_max {
                             self.errors.push(SemanticDiagnostic::new(
                                 "E0305",
-                                "negative integer literal is outside the range of `i32`",
+                                format!("negative integer literal is outside the range of `{t}`"),
                                 e.span,
                             ));
                         }
@@ -584,47 +846,243 @@ impl Checker {
                         "unary `-` requires a numeric operand",
                         e.span,
                     ));
+                } else if op == "!" && ty != Ty::Bool {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0302",
+                        "unary `!` requires a bool operand",
+                        e.span,
+                    ));
+                } else if op != "-" && op != "!" {
+                    self.errors.push(SemanticDiagnostic::new(
+                        "E0302",
+                        format!("unary operator `{op}` is not supported"),
+                        e.span,
+                    ));
                 }
-                ty
+                if op == "!" {
+                    Ty::Bool
+                } else {
+                    ty
+                }
             }
         }
     }
 }
 fn is_numeric(t: Ty) -> bool {
-    matches!(t, Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64)
+    t.is_integer() || matches!(t, Ty::F32 | Ty::F64)
+}
+
+fn integer_positive_max(signed: bool, width: u32) -> u128 {
+    if signed {
+        if width == 128 {
+            i128::MAX as u128
+        } else {
+            (1u128 << (width - 1)) - 1
+        }
+    } else if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+fn integer_mask(width: u32) -> u128 {
+    if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+fn constant_cycles(constants: &[Constant]) -> HashSet<String> {
+    fn refs(expr: &Expr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Name(name) => {
+                out.insert(name.clone());
+            }
+            ExprKind::Call { callee, args } => {
+                refs(callee, out);
+                for arg in args {
+                    refs(arg, out);
+                }
+            }
+            ExprKind::Member { base, .. }
+            | ExprKind::TupleIndex { base, .. }
+            | ExprKind::Cast { value: base, .. }
+            | ExprKind::Unary { value: base, .. } => refs(base, out),
+            ExprKind::Binary { left, right, .. } => {
+                refs(left, out);
+                refs(right, out);
+            }
+            _ => {}
+        }
+    }
+    fn visit(
+        name: &str,
+        graph: &HashMap<String, HashSet<String>>,
+        state: &mut HashMap<String, u8>,
+        stack: &mut Vec<String>,
+        cycles: &mut HashSet<String>,
+    ) {
+        state.insert(name.to_string(), 1);
+        stack.push(name.to_string());
+        if let Some(deps) = graph.get(name) {
+            for dep in deps {
+                match state.get(dep).copied().unwrap_or(0) {
+                    0 => visit(dep, graph, state, stack, cycles),
+                    1 => {
+                        if let Some(start) = stack.iter().position(|item| item == dep) {
+                            cycles.extend(stack[start..].iter().cloned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        stack.pop();
+        state.insert(name.to_string(), 2);
+    }
+    let names = constants
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<HashSet<_>>();
+    let graph = constants
+        .iter()
+        .map(|c| {
+            let mut deps = HashSet::new();
+            refs(&c.value, &mut deps);
+            deps.retain(|name| names.contains(name));
+            (c.name.clone(), deps)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut state = HashMap::new();
+    let mut cycles = HashSet::new();
+    for name in names {
+        if state.get(&name).copied().unwrap_or(0) == 0 {
+            visit(&name, &graph, &mut state, &mut Vec::new(), &mut cycles);
+        }
+    }
+    cycles
 }
 fn is_const_expr(e: &Expr) -> bool {
     eval_const_expression(e).is_some()
 }
-fn check_const_range(e: &Expr, ty: Ty, errors: &mut Vec<SemanticDiagnostic>) {
-    if ty == Ty::I32
-        && matches!(eval_const_expression(e), Some(crate::ir::Constant::Integer(v)) if i32::try_from(v).is_err())
-    {
+fn check_const_value(
+    value: &crate::ir::Constant,
+    ty: Ty,
+    span: Span,
+    errors: &mut Vec<SemanticDiagnostic>,
+) {
+    let bits = match value {
+        crate::ir::Constant::Integer(v) => *v as u128,
+        crate::ir::Constant::IntegerBits(v) => *v,
+        _ => return,
+    };
+    let width = ty.integer_width(64).unwrap();
+    let valid = if ty.is_signed_integer() {
+        let signed = if width == 128 {
+            bits as i128
+        } else {
+            let mask = (1u128 << width) - 1;
+            let value = bits & mask;
+            if value & (1u128 << (width - 1)) == 0 {
+                value as i128
+            } else {
+                (value | !mask) as i128
+            }
+        };
+        let min = if width == 128 {
+            i128::MIN
+        } else {
+            -(1i128 << (width - 1))
+        };
+        let max = if width == 128 {
+            i128::MAX
+        } else {
+            (1i128 << (width - 1)) - 1
+        };
+        signed >= min && signed <= max
+    } else {
+        width == 128 || bits < (1u128 << width)
+    };
+    if !valid {
         errors.push(SemanticDiagnostic::new(
             "E0305",
-            "constant value is outside the range of `i32`",
-            e.span,
+            format!("constant value is outside the range of `{ty}`"),
+            span,
         ));
     }
 }
 pub(crate) fn eval_const_expression(e: &Expr) -> Option<crate::ir::Constant> {
+    eval_const_expression_with(e, &HashMap::new())
+}
+pub(crate) fn eval_const_expression_with(
+    e: &Expr,
+    constants: &HashMap<String, crate::ir::Constant>,
+) -> Option<crate::ir::Constant> {
     match &e.kind {
-        ExprKind::Integer(v) => Some(crate::ir::Constant::Integer(*v)),
+        ExprKind::Name(name) => constants.get(name).cloned(),
+        ExprKind::Integer(v) => {
+            let magnitude = v.magnitude()?;
+            Some(if magnitude <= i64::MAX as u128 {
+                crate::ir::Constant::Integer(magnitude as i64)
+            } else {
+                crate::ir::Constant::IntegerBits(magnitude)
+            })
+        }
         ExprKind::Float(v) => Some(crate::ir::Constant::Float(*v)),
         ExprKind::Bool(v) => Some(crate::ir::Constant::Bool(*v)),
+        ExprKind::Character(v) => Some(crate::ir::Constant::Character(*v)),
         ExprKind::String(v) => Some(crate::ir::Constant::String(v.clone())),
-        ExprKind::Unary { op, value } if op == "-" => match eval_const_expression(value)? {
-            crate::ir::Constant::Integer(v) => Some(crate::ir::Constant::Integer(v.checked_neg()?)),
-            crate::ir::Constant::Float(v) => Some(crate::ir::Constant::Float(-v)),
-            _ => None,
-        },
+        ExprKind::Unary { op, value } if op == "!" => {
+            match eval_const_expression_with(value, constants)? {
+                crate::ir::Constant::Bool(v) => Some(crate::ir::Constant::Bool(!v)),
+                _ => None,
+            }
+        }
+        ExprKind::Unary { op, value } if op == "-" => {
+            match eval_const_expression_with(value, constants)? {
+                crate::ir::Constant::Integer(v) => {
+                    Some(crate::ir::Constant::Integer(v.checked_neg()?))
+                }
+                crate::ir::Constant::IntegerBits(v) => {
+                    Some(crate::ir::Constant::IntegerBits(0u128.wrapping_sub(v)))
+                }
+                crate::ir::Constant::Float(v) => Some(crate::ir::Constant::Float(-v)),
+                _ => None,
+            }
+        }
         ExprKind::Cast { value, target } => {
             let target = Ty::parse(target)?;
-            const_cast(eval_const_expression(value)?, target)
+            const_cast(eval_const_expression_with(value, constants)?, target)
         }
         ExprKind::Binary { left, op, right } => {
-            let a = eval_const_expression(left)?;
-            let b = eval_const_expression(right)?;
+            let a = eval_const_expression_with(left, constants)?;
+            if op == "&&" {
+                let crate::ir::Constant::Bool(a) = a else {
+                    return None;
+                };
+                if !a {
+                    return Some(crate::ir::Constant::Bool(false));
+                }
+                let crate::ir::Constant::Bool(b) = eval_const_expression_with(right, constants)?
+                else {
+                    return None;
+                };
+                return Some(crate::ir::Constant::Bool(b));
+            }
+            if op == "||" {
+                let crate::ir::Constant::Bool(a) = a else {
+                    return None;
+                };
+                if a {
+                    return Some(crate::ir::Constant::Bool(true));
+                }
+                let crate::ir::Constant::Bool(b) = eval_const_expression_with(right, constants)?
+                else {
+                    return None;
+                };
+                return Some(crate::ir::Constant::Bool(b));
+            }
+            let b = eval_const_expression_with(right, constants)?;
             match (a, b) {
                 (crate::ir::Constant::Integer(a), crate::ir::Constant::Integer(b)) => {
                     match op.as_str() {
@@ -682,10 +1140,80 @@ pub(crate) fn eval_const_expression(e: &Expr) -> Option<crate::ir::Constant> {
 fn const_cast(value: crate::ir::Constant, target: Ty) -> Option<crate::ir::Constant> {
     use crate::ir::Constant as C;
     match (value, target) {
-        (C::Integer(v), Ty::I32) => Some(C::Integer(i64::from(i32::try_from(v).ok()?))),
-        (C::Integer(v), Ty::I64) => Some(C::Integer(v)),
+        (C::Integer(v), t) if t.is_integer() => {
+            let width = t.integer_width(64)?;
+            let raw = if t.is_signed_integer() {
+                let min = if width == 128 {
+                    i128::MIN
+                } else {
+                    -(1i128 << (width - 1))
+                };
+                let max = if width == 128 {
+                    i128::MAX
+                } else {
+                    (1i128 << (width - 1)) - 1
+                };
+                let value = i128::from(v);
+                if value < min || value > max {
+                    return None;
+                }
+                (value as u128) & integer_mask(width)
+            } else {
+                if v < 0 || (v as u128) > integer_positive_max(false, width) {
+                    return None;
+                }
+                (v as u128) & integer_mask(width)
+            };
+            Some(if matches!(t, Ty::I32 | Ty::I64) {
+                C::Integer(v)
+            } else {
+                C::IntegerBits(raw)
+            })
+        }
+        (C::IntegerBits(v), t) if t.is_integer() => {
+            let width = t.integer_width(64)?;
+            if t.is_signed_integer() && v > integer_positive_max(true, width) {
+                return None;
+            }
+            if !t.is_signed_integer() && v > integer_positive_max(false, width) {
+                return None;
+            }
+            let bits = v & integer_mask(width);
+            Some(if matches!(t, Ty::I32 | Ty::I64) {
+                C::Integer(v as i64)
+            } else {
+                C::IntegerBits(bits)
+            })
+        }
         (C::Integer(v), Ty::F32) => Some(C::Float((v as f32) as f64)),
         (C::Integer(v), Ty::F64) => Some(C::Float(v as f64)),
+        (C::IntegerBits(v), Ty::F32) => Some(C::Float((v as f32) as f64)),
+        (C::IntegerBits(v), Ty::F64) => Some(C::Float(v as f64)),
+        (C::Float(v), t) if t.is_integer() => {
+            let width = t.integer_width(64)?;
+            let (lower, upper) = if t.is_signed_integer() {
+                (
+                    -2f64.powi((width - 1) as i32),
+                    2f64.powi((width - 1) as i32),
+                )
+            } else {
+                (0.0, 2f64.powi(width as i32))
+            };
+            if !v.is_finite() || v < lower || v >= upper {
+                return None;
+            }
+            let bits = if t.is_signed_integer() {
+                (v.trunc() as i128) as u128
+            } else {
+                v.trunc() as u128
+            };
+            let bits = bits & integer_mask(width);
+            Some(if matches!(t, Ty::I32 | Ty::I64) {
+                C::Integer(bits as i64)
+            } else {
+                C::IntegerBits(bits)
+            })
+        }
         (C::Float(v), Ty::I32) if v.is_finite() && v >= i32::MIN as f64 && v < 2_147_483_648.0 => {
             Some(C::Integer(i64::from(v.trunc() as i32)))
         }
@@ -706,30 +1234,4 @@ fn checked_const_shift(value: i64, count: i64, width: u32) -> Option<i64> {
     let count = count as u32;
     let shifted = value.checked_shl(count)?;
     ((shifted >> count) == value).then_some(shifted)
-}
-fn returns_on_all_paths(body: &[Statement]) -> bool {
-    for statement in body {
-        let returns = match statement {
-            Statement::Return(_, _) => true,
-            Statement::Block(nested, _) => returns_on_all_paths(nested),
-            Statement::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                !else_body.is_empty()
-                    && returns_on_all_paths(then_body)
-                    && returns_on_all_paths(else_body)
-            }
-            Statement::Let { .. }
-            | Statement::Const(_)
-            | Statement::Assign { .. }
-            | Statement::Expression(_, _)
-            | Statement::While { .. } => false,
-        };
-        if returns {
-            return true;
-        }
-    }
-    false
 }

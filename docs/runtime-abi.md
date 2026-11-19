@@ -30,7 +30,7 @@ Alignment must be non-zero and a power of two. A zero-size allocation, invalid l
 
 ### I/O
 
-The runtime exports `jahe_rt_v1_print_i32`, `_i64`, `_f32`, `_f64`, `_bool`, and `_str`. Numeric helpers take the matching primitive type; boolean takes `u8`; string takes a borrowed NUL-terminated UTF-8 pointer. The string pointer is not retained; compiler string literals live for the full executable lifetime. Every helper writes one newline and returns a status code. NUL-containing source strings remain rejected by the native backend because this v1 string ABI is NUL-terminated.
+The runtime exports `jahe_rt_v1_print_i32`, `_i64`, `_f32`, `_f64`, `_bool`, `_char`, and `_str`. Numeric helpers take the matching primitive type; boolean takes `u8`; char takes a Unicode scalar code point in `u32` and returns `InvalidArgument` for a surrogate or out-of-range scalar; string takes a borrowed NUL-terminated UTF-8 pointer. The string pointer is not retained; compiler string literals live for the full executable lifetime. Every helper writes one newline and returns a status code. The char export is an additive ABI v1 symbol using an already permitted fixed-width type, so it does not change existing ABI layouts or call contracts. NUL-containing source strings remain rejected by the native backend because this v1 string ABI is NUL-terminated.
 
 ## Build and capabilities
 

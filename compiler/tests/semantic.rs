@@ -19,6 +19,36 @@ fn rejects_unknown_types_and_duplicate_functions_or_parameters() {
 }
 
 #[test]
+fn validates_signed_unsigned_and_pointer_integer_literal_ranges() {
+    let source = r#"
+        module integer_ranges;
+        func a() -> i8 { return 128; }
+        func b() -> i8 { return -129; }
+        func c() -> i16 { return 32768; }
+        func d() -> i16 { return -32769; }
+        func e() -> i32 { return 2147483648; }
+        func f() -> i32 { return -2147483649; }
+        func g() -> i64 { return 9223372036854775808; }
+        func h() -> i64 { return -9223372036854775809; }
+        func i() -> i128 { return 170141183460469231731687303715884105728; }
+        func j() -> i128 { return -170141183460469231731687303715884105729; }
+        func k() -> u8 { return 256; }
+        func l() -> u16 { return 65536; }
+        func m() -> u32 { return 4294967296; }
+        func n() -> u64 { return 18446744073709551616; }
+        func o() -> u128 { return 340282366920938463463374607431768211456; }
+        func p() -> isize { return 9223372036854775808; }
+        func q() -> usize { return 18446744073709551616; }
+        func r() -> u8 { return -1; }
+    "#;
+    let diagnostics = frontend::analyze(source).unwrap();
+    assert!(diagnostics.len() >= 18, "diagnostics: {diagnostics:#?}");
+    assert!(diagnostics
+        .iter()
+        .all(|d| d.code == "E0305" || d.code == "E0301"));
+}
+
+#[test]
 fn rejects_duplicates_undefined_names_and_scope_escapes() {
     let result = errors("module m; fn f() { let x: i32 = 1; let x: i32 = 2; { let y: bool = true; } println(y); missing(); }");
     assert!(result.iter().any(|e| e.code == "E0203"));
@@ -74,4 +104,31 @@ fn checks_return_completeness_across_structured_control_flow() {
     )
     .is_empty());
     assert!(errors("module m; fn f() -> i32 { { return 1; } }").is_empty());
+}
+
+#[test]
+fn never_is_not_void_or_a_storable_parameter_value() {
+    let errors =
+        frontend::analyze("module never_types; func bad(value: never) -> never { return; }")
+            .unwrap();
+    assert!(errors
+        .iter()
+        .any(|e| e.message.contains("parameter cannot have type `never`")));
+    assert!(errors.iter().any(|e| e.message.contains("type mismatch")));
+}
+
+#[test]
+fn character_ordering_is_rejected_until_the_language_rule_is_approved() {
+    let errors = frontend::analyze(
+        "module char_order; func less(a: char, b: char) -> bool { return a < b; }",
+    )
+    .unwrap();
+    assert!(errors.iter().any(|e| e.code == "E0303"));
+}
+
+#[test]
+fn cyclic_constant_dependencies_have_a_diagnostic() {
+    let errors =
+        frontend::analyze("module const_cycle; const A: i32 = B; const B: i32 = A;").unwrap();
+    assert_eq!(errors.iter().filter(|e| e.code == "E0702").count(), 2);
 }

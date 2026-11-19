@@ -25,6 +25,30 @@ fn lowers_functions_parameters_and_return_values_with_types() {
 }
 
 #[test]
+fn pointer_sized_integers_require_an_explicit_supported_target() {
+    let source = "module target; func value() -> usize { return 1; }";
+    let unsupported = jahe_compiler::frontend::lower_to_ir_for_target(
+        source,
+        jahe_compiler::target::TargetSpec {
+            triple: "aarch64-unknown-linux-gnu",
+            pointer_width: 64,
+        },
+    )
+    .unwrap_err();
+    assert!(unsupported.iter().any(|d| d.code == "E0901"));
+
+    let supported = jahe_compiler::frontend::lower_to_ir_for_target(
+        source,
+        jahe_compiler::target::TargetSpec::WINDOWS_X86_64_MSVC,
+    )
+    .unwrap();
+    assert_eq!(
+        supported.functions[0].return_type,
+        jahe_compiler::ir::Type::USize
+    );
+}
+
+#[test]
 fn lowers_variables_literals_comparisons_calls_and_locations() {
     let module = lower("module m; fn is_ok(x: f64) -> bool { let y: f64 = x + 1.5; return y >= 2.0; } fn main() { let ok: bool = is_ok(3.0); println(ok); }");
     let function = &module.functions[0];
@@ -401,7 +425,7 @@ fn validator_rejects_non_dominating_values_and_nonreturning_loop_exit_paths() {
         .any(|e| e.code == "IR0026"));
 
     let errors = frontend::lower_to_ir_with_mode(
-        "module m; fn only_loops() -> i32 { while true { return 1; } }",
+        "module m; fn only_loops() -> i32 { while false { return 1; } }",
         jahe_compiler::parser::SyntaxMode::Legacy,
     )
     .unwrap_err();

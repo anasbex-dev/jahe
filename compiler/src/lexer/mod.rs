@@ -63,6 +63,8 @@ impl<'a> Lexer<'a> {
                 self.number(line, column)?
             } else if c == '"' {
                 self.string(line, column)?
+            } else if c == '\'' {
+                self.character(line, column)?
             } else {
                 self.punctuation(line, column)?
             };
@@ -144,18 +146,14 @@ impl<'a> Lexer<'a> {
                 self.advance();
             }
         }
-        let text: String = self.chars[start..self.offset]
-            .iter()
-            .filter(|c| **c != '_')
-            .collect();
+        let raw: String = self.chars[start..self.offset].iter().collect();
+        let text = raw.replace('_', "");
         if float {
             text.parse().map(TokenKind::Float).map_err(|_| {
                 Diagnostic::new("invalid floating-point literal", self.span(line, column))
             })
         } else {
-            text.parse().map(TokenKind::Integer).map_err(|_| {
-                Diagnostic::new("integer literal is out of range", self.span(line, column))
-            })
+            Ok(TokenKind::Integer(token::IntegerLiteral { raw, radix: 10 }))
         }
     }
 
@@ -187,6 +185,73 @@ impl<'a> Lexer<'a> {
             "unterminated string literal",
             self.span(line, column),
         ))
+    }
+
+    fn character(&mut self, line: usize, column: usize) -> Result<TokenKind, Diagnostic> {
+        self.advance();
+        let value = match self.advance() {
+            Some('\\') => match self.advance() {
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('0') => '\0',
+                Some('\\') => '\\',
+                Some('\'') => '\'',
+                Some('"') => '"',
+                Some('u') if self.current() == Some('{') => {
+                    self.advance();
+                    let start = self.offset;
+                    while self.current().is_some_and(|c| c.is_ascii_hexdigit()) {
+                        self.advance();
+                    }
+                    let digits: String = self.chars[start..self.offset].iter().collect();
+                    if digits.is_empty() || self.current() != Some('}') {
+                        return Err(Diagnostic::new(
+                            "invalid Unicode escape in character literal",
+                            self.span(line, column),
+                        ));
+                    }
+                    self.advance();
+                    let scalar = u32::from_str_radix(&digits, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(|| {
+                            Diagnostic::new(
+                                "Unicode escape is not a valid scalar value",
+                                self.span(line, column),
+                            )
+                        })?;
+                    scalar
+                }
+                Some(other) => {
+                    return Err(Diagnostic::new(
+                        format!("unsupported character escape \\{other}"),
+                        self.span(line, column),
+                    ))
+                }
+                None => {
+                    return Err(Diagnostic::new(
+                        "unterminated character literal",
+                        self.span(line, column),
+                    ))
+                }
+            },
+            Some(c) if c != '\n' && c != '\r' && c != '\'' => c,
+            _ => {
+                return Err(Diagnostic::new(
+                    "character literal must contain exactly one Unicode scalar",
+                    self.span(line, column),
+                ))
+            }
+        };
+        if self.current() != Some('\'') {
+            return Err(Diagnostic::new(
+                "character literal must contain exactly one Unicode scalar",
+                self.span(line, column),
+            ));
+        }
+        self.advance();
+        Ok(TokenKind::Character(value))
     }
 
     fn punctuation(&mut self, line: usize, column: usize) -> Result<TokenKind, Diagnostic> {
@@ -237,8 +302,16 @@ impl<'a> Lexer<'a> {
                 TokenKind::ShiftRight
             }
             '>' => TokenKind::Greater,
+            '&' if self.current() == Some('&') => {
+                self.advance();
+                TokenKind::AmpAmp
+            }
             '&' => TokenKind::Ampersand,
             '^' => TokenKind::Caret,
+            '|' if self.current() == Some('|') => {
+                self.advance();
+                TokenKind::PipePipe
+            }
             '|' => TokenKind::Pipe,
             '~' => TokenKind::Tilde,
             _ => {

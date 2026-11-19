@@ -12,7 +12,7 @@ impl ParameterType {
     pub fn accepts(self, ty: Type) -> bool {
         match self {
             Self::Exact(expected) => expected == ty,
-            Self::AnyValue => ty != Type::Void,
+            Self::AnyValue => !matches!(ty, Type::Void | Type::Never),
         }
     }
 }

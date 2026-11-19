@@ -16,7 +16,7 @@ pub mod verify;
 pub use blocks::BasicBlock;
 pub use external::{ExternalFunction, ParameterType, Signature};
 pub use functions::{Function, Parameter};
-pub use instructions::{BinaryOp, Instruction, InstructionKind, Terminator};
+pub use instructions::{BinaryOp, Instruction, InstructionKind, Terminator, UnaryOp};
 pub use module::{Diagnostic, Module};
 pub use types::Type;
 pub use values::{BlockId, Constant, Value, ValueId};

@@ -35,6 +35,15 @@ print_number!(jahe_rt_v1_print_i64, i64);
 print_number!(jahe_rt_v1_print_f32, f32);
 print_number!(jahe_rt_v1_print_f64, f64);
 
+/// Prints one Unicode scalar followed by a newline. Invalid scalar values return `InvalidArgument`.
+#[no_mangle]
+pub extern "C" fn jahe_rt_v1_print_char(value: u32) -> u32 {
+    let Some(character) = char::from_u32(value) else {
+        return RuntimeStatus::InvalidArgument.code();
+    };
+    output(|out| writeln!(out, "{character}"))
+}
+
 #[no_mangle]
 pub extern "C" fn jahe_rt_v1_print_bool(value: u8) -> u32 {
     output(|out| writeln!(out, "{}", value != 0))

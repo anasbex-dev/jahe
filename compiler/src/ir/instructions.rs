@@ -19,6 +19,10 @@ pub enum BinaryOp {
     Greater,
     GreaterEqual,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Negate,
+}
 impl std::fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -48,6 +52,10 @@ pub enum InstructionKind {
         op: BinaryOp,
         left: Value,
         right: Value,
+    },
+    Unary {
+        op: UnaryOp,
+        value: Value,
     },
     Cast {
         value: Value,

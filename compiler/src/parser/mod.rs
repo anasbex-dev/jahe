@@ -301,22 +301,24 @@ impl Parser {
         let mut left = self.postfix()?;
         loop {
             let (prec, op) = match self.peek().kind {
-                TokenKind::EqualEqual => (1, "=="),
-                TokenKind::BangEqual => (1, "!="),
-                TokenKind::Less => (1, "<"),
-                TokenKind::LessEqual => (1, "<="),
-                TokenKind::Greater => (1, ">"),
-                TokenKind::GreaterEqual => (1, ">="),
-                TokenKind::Pipe => (2, "|"),
-                TokenKind::Caret => (3, "^"),
-                TokenKind::Ampersand => (4, "&"),
-                TokenKind::ShiftLeft => (5, "<<"),
-                TokenKind::ShiftRight => (5, ">>"),
-                TokenKind::Plus => (6, "+"),
-                TokenKind::Minus => (6, "-"),
-                TokenKind::Star => (7, "*"),
-                TokenKind::Slash => (7, "/"),
-                TokenKind::Percent => (7, "%"),
+                TokenKind::PipePipe => (0, "||"),
+                TokenKind::AmpAmp => (1, "&&"),
+                TokenKind::EqualEqual => (2, "=="),
+                TokenKind::BangEqual => (2, "!="),
+                TokenKind::Less => (2, "<"),
+                TokenKind::LessEqual => (2, "<="),
+                TokenKind::Greater => (2, ">"),
+                TokenKind::GreaterEqual => (2, ">="),
+                TokenKind::Pipe => (3, "|"),
+                TokenKind::Caret => (4, "^"),
+                TokenKind::Ampersand => (5, "&"),
+                TokenKind::ShiftLeft => (6, "<<"),
+                TokenKind::ShiftRight => (6, ">>"),
+                TokenKind::Plus => (7, "+"),
+                TokenKind::Minus => (7, "-"),
+                TokenKind::Star => (8, "*"),
+                TokenKind::Slash => (8, "/"),
+                TokenKind::Percent => (8, "%"),
                 _ => break,
             };
             if prec < min {
@@ -368,10 +370,16 @@ impl Parser {
                         base: Box::new(expr.clone()),
                         member,
                     },
-                    TokenKind::Integer(index) if index >= 0 => ExprKind::TupleIndex {
-                        base: Box::new(expr.clone()),
-                        index: index as u32,
-                    },
+                    TokenKind::Integer(index) => {
+                        let digits = index.raw.replace('_', "");
+                        let Ok(index) = digits.parse::<u32>() else {
+                            return Err(Diagnostic::new("tuple index is out of range", token.span));
+                        };
+                        ExprKind::TupleIndex {
+                            base: Box::new(expr.clone()),
+                            index,
+                        }
+                    }
                     _ => {
                         return Err(Diagnostic::new(
                             "expected member name or tuple position after '.'",
@@ -405,6 +413,7 @@ impl Parser {
         let kind = match token.kind {
             TokenKind::Integer(v) => ExprKind::Integer(v),
             TokenKind::Float(v) => ExprKind::Float(v),
+            TokenKind::Character(v) => ExprKind::Character(v),
             TokenKind::String(v) => ExprKind::String(v),
             TokenKind::Keyword(Keyword::True) => ExprKind::Bool(true),
             TokenKind::Keyword(Keyword::False) => ExprKind::Bool(false),
@@ -414,6 +423,16 @@ impl Parser {
                 return Ok(Expr {
                     kind: ExprKind::Unary {
                         op: "-".into(),
+                        value: Box::new(value),
+                    },
+                    span,
+                });
+            }
+            TokenKind::Bang => {
+                let value = self.primary()?;
+                return Ok(Expr {
+                    kind: ExprKind::Unary {
+                        op: "!".into(),
                         value: Box::new(value),
                     },
                     span,

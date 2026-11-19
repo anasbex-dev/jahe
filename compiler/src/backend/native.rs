@@ -75,6 +75,20 @@ impl NativeBackend {
 
         let mut ids = HashMap::<String, FuncId>::new();
         for function in &module.functions {
+            if function
+                .params
+                .iter()
+                .any(|param| matches!(param.value.ty, Type::I128 | Type::U128))
+                || matches!(function.return_type, Type::I128 | Type::U128)
+            {
+                return Err(unsupported(
+                    function.span,
+                    format!(
+                        "function `{}` uses an i128 ABI parameter or return, which Cranelift's default Windows x64 ABI does not support",
+                        function.name
+                    ),
+                ));
+            }
             let signature = function_signature(&object, function);
             let id = object
                 .declare_function(
@@ -111,6 +125,7 @@ impl NativeBackend {
                 Type::F32,
                 Type::F64,
                 Type::Bool,
+                Type::Char,
                 Type::Str,
             ] {
                 let signature = helper_signature(&object, ty);
@@ -311,7 +326,7 @@ fn function_signature(
             .iter()
             .map(|p| AbiParam::new(clif_type(p.value.ty, ptr).expect("verified type"))),
     );
-    if function.return_type != Type::Void {
+    if !matches!(function.return_type, Type::Void | Type::Never) {
         signature.returns.push(AbiParam::new(
             clif_type(function.return_type, ptr).expect("verified type"),
         ));
@@ -342,17 +357,32 @@ fn clif_type(
     ptr: cranelift_codegen::ir::Type,
 ) -> Result<cranelift_codegen::ir::Type, BackendError> {
     Ok(match ty {
+        Type::I8 => types::I8,
+        Type::I16 => types::I16,
         Type::I32 => types::I32,
         Type::I64 => types::I64,
+        Type::I128 | Type::U128 => types::I128,
+        Type::ISize | Type::USize => ptr,
+        Type::U8 => types::I8,
+        Type::U16 => types::I16,
+        Type::U32 => types::I32,
+        Type::U64 => types::I64,
         Type::F32 => types::F32,
         Type::F64 => types::F64,
         Type::Bool => types::I8,
+        Type::Char => types::I32,
         Type::Str => ptr,
         Type::Void => {
             return Err(BackendError::new(
                 BackendErrorKind::NativeCodegen,
                 "void has no Cranelift value type",
             ))
+        }
+        Type::Never => {
+            return Err(BackendError::new(
+                BackendErrorKind::NativeCodegen,
+                "never has no Cranelift value type",
+            ));
         }
     })
 }
@@ -377,10 +407,27 @@ fn emit_instruction(
                 .ok_or_else(|| unsupported(inst.span, "constant has no result"))?
                 .ty;
             let value = match (constant, ty) {
-                (Constant::Integer(i), Type::I32 | Type::I64) => {
+                (Constant::Integer(i), ty) if ty.is_integer() => {
                     builder.ins().iconst(clif_type(ty, pointer_type)?, *i)
                 }
+                (Constant::IntegerBits(bits), ty) if ty.is_integer() => {
+                    let clty = clif_type(ty, pointer_type)?;
+                    if clty.bits() <= 64 {
+                        builder.ins().iconst(clty, *bits as i64)
+                    } else {
+                        let lo = builder.ins().iconst(types::I64, *bits as u64 as i64);
+                        let hi = builder
+                            .ins()
+                            .iconst(types::I64, (*bits >> 64) as u64 as i64);
+                        let lo = builder.ins().uextend(types::I128, lo);
+                        let hi = builder.ins().uextend(types::I128, hi);
+                        let shift = builder.ins().iconst(types::I64, 64);
+                        let hi = builder.ins().ishl(hi, shift);
+                        builder.ins().bor(lo, hi)
+                    }
+                }
                 (Constant::Bool(b), Type::Bool) => builder.ins().iconst(types::I8, i64::from(*b)),
+                (Constant::Character(c), Type::Char) => builder.ins().iconst(types::I32, *c as i64),
                 (Constant::Float(f), Type::F32) => builder.ins().f32const(*f as f32),
                 (Constant::Float(f), Type::F64) => builder.ins().f64const(*f),
                 (Constant::String(s), Type::Str) => {
@@ -555,11 +602,41 @@ fn emit_instruction(
                         "string comparisons are not supported by the native backend",
                     ))
                 }
+                Type::Char => match op {
+                    Equal => builder.ins().icmp(IntCC::Equal, lhs, rhs),
+                    NotEqual => builder.ins().icmp(IntCC::NotEqual, lhs, rhs),
+                    _ => {
+                        return Err(unsupported(
+                            inst.span,
+                            "only equality comparisons are defined for char",
+                        ))
+                    }
+                },
                 Type::Void => {
                     return Err(unsupported(inst.span, "void operands are not supported"))
                 }
+                Type::Never => return Err(unsupported(inst.span, "never has no runtime value")),
+                Type::I8
+                | Type::I16
+                | Type::I128
+                | Type::ISize
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::U128
+                | Type::USize => {
+                    native_integer_binary(builder, *op, lhs, rhs, left.ty, inst.span, pointer_type)?
+                }
             };
             Ok(Some(result))
+        }
+        InstructionKind::Unary {
+            op: crate::ir::UnaryOp::Negate,
+            value,
+        } => {
+            let value = val(value)?;
+            Ok(Some(builder.ins().fneg(value)))
         }
         InstructionKind::Cast { value, target } => {
             let source = val(value)?;
@@ -610,6 +687,204 @@ fn emit_instruction(
     }
 }
 
+fn native_integer_binary(
+    builder: &mut FunctionBuilder<'_>,
+    op: BinaryOp,
+    lhs: ClifValue,
+    rhs: ClifValue,
+    ty: Type,
+    span: crate::lexer::token::Span,
+    pointer_type: cranelift_codegen::ir::Type,
+) -> Result<ClifValue, BackendError> {
+    use BinaryOp::*;
+    let clty = clif_type(ty, pointer_type)?;
+    let width = ty.integer_width(pointer_type.bits() as u8).unwrap();
+    let signed = ty.is_signed_integer();
+    let trap = cranelift_codegen::ir::TrapCode::unwrap_user(2);
+    let value = match op {
+        Add | Sub | Mul => {
+            let (result, overflow) = match (op, signed) {
+                (Add, true) => builder.ins().sadd_overflow(lhs, rhs),
+                (Sub, true) => builder.ins().ssub_overflow(lhs, rhs),
+                (Mul, true) => builder.ins().smul_overflow(lhs, rhs),
+                (Add, false) => builder.ins().uadd_overflow(lhs, rhs),
+                (Sub, false) => builder.ins().usub_overflow(lhs, rhs),
+                (Mul, false) => builder.ins().umul_overflow(lhs, rhs),
+                _ => unreachable!(),
+            };
+            builder.ins().trapnz(overflow, trap);
+            result
+        }
+        Div | Rem => {
+            let zero = emit_integer_constant(builder, clty, 0);
+            let is_zero = builder.ins().icmp(IntCC::Equal, rhs, zero);
+            builder
+                .ins()
+                .trapnz(is_zero, cranelift_codegen::ir::TrapCode::unwrap_user(3));
+            if width == 128 {
+                let (quotient, remainder) = if signed {
+                    let minimum = emit_integer_constant(builder, clty, 1u128 << 127);
+                    let minus_one = emit_integer_constant(builder, clty, u128::MAX);
+                    let is_min = builder.ins().icmp(IntCC::Equal, lhs, minimum);
+                    let is_minus_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
+                    let overflow = builder.ins().band(is_min, is_minus_one);
+                    builder.ins().trapnz(overflow, trap);
+                    let lhs_negative = builder.ins().icmp(IntCC::SignedLessThan, lhs, zero);
+                    let rhs_negative = builder.ins().icmp(IntCC::SignedLessThan, rhs, zero);
+                    let abs_lhs = builder.ins().isub(zero, lhs);
+                    let abs_rhs = builder.ins().isub(zero, rhs);
+                    let abs_lhs = builder.ins().select(lhs_negative, abs_lhs, lhs);
+                    let abs_rhs = builder.ins().select(rhs_negative, abs_rhs, rhs);
+                    let (q, r) = native_udivrem128(builder, abs_lhs, abs_rhs);
+                    let quotient_negative = builder.ins().bxor(lhs_negative, rhs_negative);
+                    let negative_q = builder.ins().isub(zero, q);
+                    let negative_r = builder.ins().isub(zero, r);
+                    (
+                        builder.ins().select(quotient_negative, negative_q, q),
+                        builder.ins().select(lhs_negative, negative_r, r),
+                    )
+                } else {
+                    native_udivrem128(builder, lhs, rhs)
+                };
+                return Ok(if op == Div { quotient } else { remainder });
+            }
+            if signed {
+                let min_bits = 1u128 << (width - 1);
+                let min = emit_integer_constant(builder, clty, min_bits);
+                let minus_one = emit_integer_constant(builder, clty, u128::MAX);
+                let is_min = builder.ins().icmp(IntCC::Equal, lhs, min);
+                let is_negative_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
+                let overflow = builder.ins().band(is_min, is_negative_one);
+                builder.ins().trapnz(overflow, trap);
+                if op == Div {
+                    builder.ins().sdiv(lhs, rhs)
+                } else {
+                    builder.ins().srem(lhs, rhs)
+                }
+            } else if op == Div {
+                builder.ins().udiv(lhs, rhs)
+            } else {
+                builder.ins().urem(lhs, rhs)
+            }
+        }
+        BitAnd => builder.ins().band(lhs, rhs),
+        BitOr => builder.ins().bor(lhs, rhs),
+        BitXor => builder.ins().bxor(lhs, rhs),
+        ShiftLeft | ShiftRight => {
+            let zero = emit_integer_constant(builder, clty, 0);
+            let upper = emit_integer_constant(builder, clty, u128::from(width));
+            let negative = if signed {
+                builder.ins().icmp(IntCC::SignedLessThan, rhs, zero)
+            } else {
+                builder.ins().iconst(types::I8, 0)
+            };
+            let too_large = builder.ins().icmp(
+                if signed {
+                    IntCC::SignedGreaterThanOrEqual
+                } else {
+                    IntCC::UnsignedGreaterThanOrEqual
+                },
+                rhs,
+                upper,
+            );
+            let invalid = builder.ins().bor(negative, too_large);
+            builder
+                .ins()
+                .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(5));
+            if op == ShiftRight {
+                if signed {
+                    builder.ins().sshr(lhs, rhs)
+                } else {
+                    builder.ins().ushr(lhs, rhs)
+                }
+            } else {
+                let shifted = builder.ins().ishl(lhs, rhs);
+                let restored = if signed {
+                    builder.ins().sshr(shifted, rhs)
+                } else {
+                    builder.ins().ushr(shifted, rhs)
+                };
+                let overflow = builder.ins().icmp(IntCC::NotEqual, restored, lhs);
+                builder.ins().trapnz(overflow, trap);
+                shifted
+            }
+        }
+        Equal => builder.ins().icmp(IntCC::Equal, lhs, rhs),
+        NotEqual => builder.ins().icmp(IntCC::NotEqual, lhs, rhs),
+        Less | LessEqual | Greater | GreaterEqual => {
+            let cc = match (op, signed) {
+                (Less, true) => IntCC::SignedLessThan,
+                (LessEqual, true) => IntCC::SignedLessThanOrEqual,
+                (Greater, true) => IntCC::SignedGreaterThan,
+                (GreaterEqual, true) => IntCC::SignedGreaterThanOrEqual,
+                (Less, false) => IntCC::UnsignedLessThan,
+                (LessEqual, false) => IntCC::UnsignedLessThanOrEqual,
+                (Greater, false) => IntCC::UnsignedGreaterThan,
+                (GreaterEqual, false) => IntCC::UnsignedGreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            builder.ins().icmp(cc, lhs, rhs)
+        }
+    };
+    let _ = span;
+    Ok(value)
+}
+
+fn emit_integer_constant(
+    builder: &mut FunctionBuilder<'_>,
+    ty: cranelift_codegen::ir::Type,
+    bits: u128,
+) -> ClifValue {
+    if ty.bits() <= 64 {
+        builder.ins().iconst(ty, bits as i64)
+    } else {
+        let lo = builder.ins().iconst(types::I64, bits as u64 as i64);
+        let hi = builder.ins().iconst(types::I64, (bits >> 64) as u64 as i64);
+        let lo = builder.ins().uextend(types::I128, lo);
+        let hi = builder.ins().uextend(types::I128, hi);
+        let shift = builder.ins().iconst(types::I64, 64);
+        let hi = builder.ins().ishl(hi, shift);
+        builder.ins().bor(lo, hi)
+    }
+}
+
+/// Unsigned restoring division for internal i128 bit patterns. Each iteration
+/// consumes one numerator bit. The carry bit preserves the 129th bit of the
+/// shifted remainder; subtraction is intentionally modular and is selected only
+/// when the full (possibly 129-bit) remainder is at least the divisor.
+fn native_udivrem128(
+    builder: &mut FunctionBuilder<'_>,
+    numerator: ClifValue,
+    divisor: ClifValue,
+) -> (ClifValue, ClifValue) {
+    let zero = emit_integer_constant(builder, types::I128, 0);
+    let one = emit_integer_constant(builder, types::I128, 1);
+    let top_bit = emit_integer_constant(builder, types::I128, 1u128 << 127);
+    let mut quotient = zero;
+    let mut remainder = zero;
+    let shift_one = builder.ins().iconst(types::I64, 1);
+    for bit_index in (0..128u32).rev() {
+        let shift = builder.ins().iconst(types::I64, i64::from(bit_index));
+        let incoming = builder.ins().ushr(numerator, shift);
+        let incoming = builder.ins().band(incoming, one);
+        let carry_bits = builder.ins().band(remainder, top_bit);
+        let carry = builder.ins().icmp(IntCC::NotEqual, carry_bits, zero);
+        let doubled = builder.ins().ishl(remainder, shift_one);
+        let candidate = builder.ins().bor(doubled, incoming);
+        let at_least_divisor =
+            builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, candidate, divisor);
+        let subtract = builder.ins().bor(carry, at_least_divisor);
+        let reduced = builder.ins().isub(candidate, divisor);
+        remainder = builder.ins().select(subtract, reduced, candidate);
+        let quotient_bit = builder.ins().ishl(one, shift);
+        let quotient_bit = builder.ins().select(subtract, quotient_bit, zero);
+        quotient = builder.ins().bor(quotient, quotient_bit);
+    }
+    (quotient, remainder)
+}
+
 fn native_cast(
     builder: &mut FunctionBuilder<'_>,
     value: ClifValue,
@@ -619,8 +894,11 @@ fn native_cast(
     pointer_type: cranelift_codegen::ir::Type,
 ) -> Result<ClifValue, BackendError> {
     use Type::*;
-    let source_integer = matches!(source, I32 | I64);
-    let target_integer = matches!(target, I32 | I64);
+    if source.is_integer() && target.is_integer() {
+        return native_integer_cast(builder, value, source, target, span, pointer_type);
+    }
+    let source_integer = source.is_integer();
+    let target_integer = target.is_integer();
     let source_float = matches!(source, F32 | F64);
     let target_float = matches!(target, F32 | F64);
     let result = match (source_integer, source_float, target_integer, target_float) {
@@ -638,24 +916,28 @@ fn native_cast(
                 .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
             narrowed
         }
-        (true, false, false, true) => builder
-            .ins()
-            .fcvt_from_sint(clif_type(target, pointer_type)?, value),
+        (true, false, false, true) => {
+            let to = clif_type(target, pointer_type)?;
+            if source.is_signed_integer() {
+                builder.ins().fcvt_from_sint(to, value)
+            } else {
+                builder.ins().fcvt_from_uint(to, value)
+            }
+        }
         (false, true, true, false) => {
             let float64 = if source == F32 {
                 builder.ins().fpromote(types::F64, value)
             } else {
                 value
             };
-            let min = if target == I32 {
-                i32::MIN as f64
+            let width = target.integer_width(pointer_type.bits() as u8).unwrap();
+            let (min, upper) = if target.is_signed_integer() {
+                (
+                    -(2f64.powi(i32::from(width - 1))),
+                    2f64.powi(i32::from(width - 1)),
+                )
             } else {
-                -9_223_372_036_854_775_808.0
-            };
-            let upper = if target == I32 {
-                2_147_483_648.0
-            } else {
-                9_223_372_036_854_775_808.0
+                (0.0, 2f64.powi(i32::from(width)))
             };
             let lower_bound = builder.ins().f64const(min);
             let upper_bound = builder.ins().f64const(upper);
@@ -669,9 +951,15 @@ fn native_cast(
             builder
                 .ins()
                 .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
-            builder
-                .ins()
-                .fcvt_to_sint(clif_type(target, pointer_type)?, float64)
+            if target.is_signed_integer() {
+                builder
+                    .ins()
+                    .fcvt_to_sint(clif_type(target, pointer_type)?, float64)
+            } else {
+                builder
+                    .ins()
+                    .fcvt_to_uint(clif_type(target, pointer_type)?, float64)
+            }
         }
         (false, true, false, true) if source == F32 && target == F64 => {
             builder.ins().fpromote(types::F64, value)
@@ -687,6 +975,60 @@ fn native_cast(
         }
     };
     Ok(result)
+}
+
+fn native_integer_cast(
+    builder: &mut FunctionBuilder<'_>,
+    value: ClifValue,
+    source: Type,
+    target: Type,
+    span: crate::lexer::token::Span,
+    pointer_type: cranelift_codegen::ir::Type,
+) -> Result<ClifValue, BackendError> {
+    let sw = source.integer_width(pointer_type.bits() as u8).unwrap();
+    let tw = target.integer_width(pointer_type.bits() as u8).unwrap();
+    let source_ty = clif_type(source, pointer_type)?;
+    let target_ty = clif_type(target, pointer_type)?;
+    let signed_source = source.is_signed_integer();
+    let signed_target = target.is_signed_integer();
+    let trap = cranelift_codegen::ir::TrapCode::unwrap_user(4);
+    if signed_source && !signed_target {
+        let zero = emit_integer_constant(builder, source_ty, 0);
+        let negative = builder.ins().icmp(IntCC::SignedLessThan, value, zero);
+        builder.ins().trapnz(negative, trap);
+    }
+    let converted = if tw > sw {
+        if signed_source && signed_target {
+            builder.ins().sextend(target_ty, value)
+        } else {
+            builder.ins().uextend(target_ty, value)
+        }
+    } else if tw < sw {
+        let narrowed = builder.ins().ireduce(target_ty, value);
+        let restored = if signed_target {
+            builder.ins().sextend(source_ty, narrowed)
+        } else {
+            builder.ins().uextend(source_ty, narrowed)
+        };
+        let valid = builder.ins().icmp(IntCC::Equal, restored, value);
+        let invalid = builder.ins().bnot(valid);
+        builder.ins().trapnz(invalid, trap);
+        narrowed
+    } else {
+        if !signed_source && signed_target {
+            let highbit = emit_integer_constant(builder, source_ty, 1u128 << (sw - 1));
+            let has_sign_bit =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, value, highbit);
+            builder.ins().trapnz(has_sign_bit, trap);
+        }
+        value
+    };
+    if source == target {
+        let _ = span;
+    }
+    Ok(converted)
 }
 
 fn edge_values(
@@ -743,11 +1085,23 @@ fn get_value(
 
 fn print_helper(ty: Type) -> &'static str {
     match ty {
+        Type::I8
+        | Type::I16
+        | Type::I128
+        | Type::ISize
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::U128
+        | Type::USize => "jahe_rt_v1_unsupported_integer_print",
+        Type::Never => "jahe_rt_v1_unsupported_never_print",
         Type::I32 => "jahe_rt_v1_print_i32",
         Type::I64 => "jahe_rt_v1_print_i64",
         Type::F32 => "jahe_rt_v1_print_f32",
         Type::F64 => "jahe_rt_v1_print_f64",
         Type::Bool => "jahe_rt_v1_print_bool",
+        Type::Char => "jahe_rt_v1_print_char",
         Type::Str => "jahe_rt_v1_print_str",
         Type::Void => "jahe_rt_v1_print_void",
     }

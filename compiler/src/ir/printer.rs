@@ -40,6 +40,9 @@ pub fn format(module: &Module) -> String {
                     InstructionKind::Constant(Constant::Integer(v)) => {
                         let _ = writeln!(o, "const {v}");
                     }
+                    InstructionKind::Constant(Constant::IntegerBits(v)) => {
+                        let _ = writeln!(o, "const bits 0x{v:032x}");
+                    }
                     InstructionKind::Constant(Constant::Float(v)) => {
                         let _ = writeln!(o, "const {v}");
                     }
@@ -49,8 +52,14 @@ pub fn format(module: &Module) -> String {
                     InstructionKind::Constant(Constant::Bool(v)) => {
                         let _ = writeln!(o, "const {v}");
                     }
+                    InstructionKind::Constant(Constant::Character(v)) => {
+                        let _ = writeln!(o, "const {v:?}");
+                    }
                     InstructionKind::Binary { op, left, right } => {
                         let _ = writeln!(o, "{} %{}, %{}", op, left.id.0, right.id.0);
+                    }
+                    InstructionKind::Unary { op, value } => {
+                        let _ = writeln!(o, "{op:?} %{}", value.id.0);
                     }
                     InstructionKind::Cast { value, target } => {
                         let _ = writeln!(o, "cast %{} to {target}", value.id.0);

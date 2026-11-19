@@ -22,6 +22,18 @@ fn abi_is_versioned_and_uses_c_calling_convention() {
 }
 
 #[test]
+fn char_print_rejects_non_scalar_values() {
+    assert_eq!(
+        jahe_runtime::io::jahe_rt_v1_print_char(0xD800),
+        jahe_runtime::RuntimeStatus::InvalidArgument.code()
+    );
+    assert_eq!(
+        jahe_runtime::io::jahe_rt_v1_print_char(0x11_0000),
+        jahe_runtime::RuntimeStatus::InvalidArgument.code()
+    );
+}
+
+#[test]
 fn allocation_deallocation_and_alignment_are_defined() {
     let pointer = jahe_rt_v1_alloc(128, 64);
     assert!(!pointer.is_null());

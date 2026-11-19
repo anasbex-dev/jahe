@@ -43,3 +43,17 @@ pub fn lower_to_ir_with_mode(
     })?;
     crate::ir::lower::lower(&module)
 }
+
+pub fn lower_to_ir_for_target(
+    source: &str,
+    target: crate::target::TargetSpec,
+) -> Result<crate::ir::Module, Vec<crate::ir::Diagnostic>> {
+    let module = parse(source).map_err(|error| {
+        vec![crate::ir::Diagnostic {
+            code: "E0001",
+            message: error.message,
+            span: error.span,
+        }]
+    })?;
+    crate::ir::lower::lower_for_target(&module, target)
+}

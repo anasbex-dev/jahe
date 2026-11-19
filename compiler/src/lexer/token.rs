@@ -6,6 +6,18 @@ pub struct Span {
     pub column: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegerLiteral {
+    /// Original decimal spelling, including source separators.
+    pub raw: String,
+    pub radix: u8,
+}
+impl IntegerLiteral {
+    pub fn magnitude(&self) -> Option<u128> {
+        u128::from_str_radix(&self.raw.replace('_', ""), u32::from(self.radix)).ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Module,
@@ -27,8 +39,9 @@ pub enum Keyword {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Identifier(String),
-    Integer(i64),
+    Integer(IntegerLiteral),
     Float(f64),
+    Character(char),
     String(String),
     Keyword(Keyword),
     LeftParen,
@@ -56,8 +69,10 @@ pub enum TokenKind {
     ShiftLeft,
     ShiftRight,
     Ampersand,
+    AmpAmp,
     Caret,
     Pipe,
+    PipePipe,
     Tilde,
     Eof,
 }
@@ -72,8 +87,9 @@ impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identifier(v) => write!(f, "identifier({v})"),
-            Self::Integer(v) => write!(f, "integer({v})"),
+            Self::Integer(v) => write!(f, "integer({})", v.raw),
             Self::Float(v) => write!(f, "float({v})"),
+            Self::Character(v) => write!(f, "character({v:?})"),
             Self::String(v) => write!(f, "string({v:?})"),
             Self::Keyword(k) => write!(f, "keyword({k:?})"),
             Self::Eof => write!(f, "EOF"),
@@ -106,8 +122,10 @@ impl fmt::Display for TokenKind {
                     Self::ShiftLeft => "<<",
                     Self::ShiftRight => ">>",
                     Self::Ampersand => "&",
+                    Self::AmpAmp => "&&",
                     Self::Caret => "^",
                     Self::Pipe => "|",
+                    Self::PipePipe => "||",
                     Self::Tilde => "~",
                     _ => unreachable!(),
                 }

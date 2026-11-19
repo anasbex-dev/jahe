@@ -12,7 +12,11 @@ pub struct Value {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     Integer(i64),
+    /// Integer bit pattern for widths or unsigned ranges that do not fit i64.
+    /// The result `Value.ty` determines signedness and active width.
+    IntegerBits(u128),
     Float(f64),
     String(String),
     Bool(bool),
+    Character(char),
 }

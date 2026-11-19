@@ -1,6 +1,6 @@
 # JAHE type system (designed)
 
-The type system below is designed, not implemented by compiler 0.7. Its source types are currently only `i32`, `i64`, `f32`, `f64`, `bool`, `str`, and `void`, as documented in [language-spec.md](language-spec.md).
+The type system below is the design contract, not implemented wholesale. The compiler carries all signed and unsigned integer widths and Unicode scalar `char` values through semantic analysis, typed IR, interpretation, and Windows x86_64 native code generation for the tested subset. It implements IEEE float operations/casts, prior-declaration scalar constants, and short-circuit boolean operators. `never` is limited to exact infinite loops and never-returning calls; i128/u128 ABI, forward constant references, typed wide constant evaluation, full `never` analysis, and exhaustive scalar edge coverage remain unfinished. Char ordering and casts are rejected pending explicit rules; see [language-spec.md](language-spec.md) and [the implementation report](compiler-0.8-implementation-report.md).
 
 ## Primitive types and target representation
 

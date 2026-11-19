@@ -3,6 +3,14 @@ use super::{
     InstructionKind, Module, ParameterType, Signature, Terminator, Type, Value, ValueId,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+
+fn integer_max(width: u32) -> u128 {
+    if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
 #[derive(Clone, Copy)]
 struct Def {
     ty: Type,
@@ -28,11 +36,14 @@ pub fn validate(module: &Module) -> Result<(), Vec<Diagnostic>> {
             );
         }
         for param in &external.signature.params {
-            if matches!(param, ParameterType::Exact(Type::Void)) {
+            if matches!(param, ParameterType::Exact(Type::Void | Type::Never)) {
                 err(
                     &mut errors,
                     "IR0042",
-                    format!("external `{}` has a void parameter", external.name),
+                    format!(
+                        "external `{}` has a non-value parameter type",
+                        external.name
+                    ),
                     external.span,
                 );
             }
@@ -124,19 +135,24 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                 p.value.span,
             );
         }
-        if p.value.ty == Type::Void {
-            err(e, "IR0010", "parameter cannot have void type", p.value.span);
+        if matches!(p.value.ty, Type::Void | Type::Never) {
+            err(
+                e,
+                "IR0010",
+                "parameter cannot have void or never type",
+                p.value.span,
+            );
         }
         insert_def(&mut defs, &p.value, None, 0, e);
     }
     for b in &f.blocks {
         for (i, inst) in b.instructions.iter().enumerate() {
             if let Some(v) = &inst.result {
-                if v.ty == Type::Void {
+                if matches!(v.ty, Type::Void | Type::Never) {
                     err(
                         e,
                         "IR0018",
-                        "instruction result cannot have void type",
+                        "instruction result cannot have void or never type",
                         inst.span,
                     );
                 }
@@ -185,12 +201,33 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                     let valid = match (c, inst.result.as_ref().map(|v| v.ty)) {
                         (Constant::Integer(v), Some(Type::I32)) => i32::try_from(*v).is_ok(),
                         (Constant::Integer(_), Some(Type::I64)) => true,
+                        (Constant::Integer(v), Some(ty)) if ty.is_integer() => {
+                            let width = ty.integer_width(64).unwrap() as u32;
+                            if ty.is_signed_integer() {
+                                if width >= 64 {
+                                    true
+                                } else {
+                                    let min = -(1i64 << (width - 1));
+                                    let max = (1i64 << (width - 1)) - 1;
+                                    (*v >= min) && (*v <= max)
+                                }
+                            } else {
+                                *v >= 0 && (*v as u128) <= integer_max(width)
+                            }
+                        }
+                        (Constant::IntegerBits(v), Some(ty)) if ty.is_integer() => {
+                            let width = ty.integer_width(64).unwrap() as u32;
+                            width == 128 || (*v >> width) == 0
+                        }
                         (Constant::Float(v), Some(Type::F32)) => {
                             v.is_finite() && v.abs() <= f32::MAX as f64
                         }
                         (Constant::Float(_), Some(Type::F64)) => true,
                         (Constant::String(_), Some(Type::Str)) => true,
                         (Constant::Bool(_), Some(Type::Bool)) => true,
+                        (Constant::Character(c), Some(Type::Char)) => {
+                            char::from_u32(*c as u32).is_some()
+                        }
                         _ => false,
                     };
                     if !valid {
@@ -218,11 +255,18 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                             | BinaryOp::ShiftLeft
                             | BinaryOp::ShiftRight
                     );
-                    let numeric = matches!(left.ty, Type::I32 | Type::I64 | Type::F32 | Type::F64);
+                    let numeric = left.ty.is_integer() || matches!(left.ty, Type::F32 | Type::F64);
                     let comparable = matches!(
                         left.ty,
-                        Type::I32 | Type::I64 | Type::F32 | Type::F64 | Type::Bool | Type::Str
+                        Type::I32
+                            | Type::I64
+                            | Type::F32
+                            | Type::F64
+                            | Type::Bool
+                            | Type::Str
+                            | Type::Char
                     );
+                    let comparable = comparable || left.ty.is_integer();
                     let integer_only = matches!(
                         op,
                         BinaryOp::Rem
@@ -232,10 +276,12 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                             | BinaryOp::ShiftLeft
                             | BinaryOp::ShiftRight
                     );
-                    let remainder_valid = !integer_only || matches!(left.ty, Type::I32 | Type::I64);
+                    let remainder_valid = !integer_only || left.ty.is_integer();
                     let valid = left.ty == right.ty
                         && if cmp {
                             comparable
+                                && (left.ty != Type::Char
+                                    || matches!(op, BinaryOp::Equal | BinaryOp::NotEqual))
                         } else {
                             numeric && remainder_valid
                         };
@@ -249,9 +295,22 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                         );
                     }
                 }
+                InstructionKind::Unary { value, .. } => {
+                    check_use(value, b.id, i, &defs, &dom, e);
+                    if !matches!(value.ty, Type::F32 | Type::F64)
+                        || inst.result.as_ref().is_none_or(|r| r.ty != value.ty)
+                    {
+                        err(
+                            e,
+                            "IR0045",
+                            "floating negation has invalid operand or result type",
+                            inst.span,
+                        );
+                    }
+                }
                 InstructionKind::Cast { value, target } => {
                     check_use(value, b.id, i, &defs, &dom, e);
-                    let numeric = |ty| matches!(ty, Type::I32 | Type::I64 | Type::F32 | Type::F64);
+                    let numeric = |ty: Type| ty.is_integer() || matches!(ty, Type::F32 | Type::F64);
                     if !numeric(value.ty)
                         || !numeric(*target)
                         || inst
@@ -278,7 +337,7 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                                 .iter()
                                 .zip(&signature.params)
                                 .any(|(a, expected)| !expected.accepts(a.ty))
-                            || (result == Type::Void) != inst.result.is_none()
+                            || (matches!(result, Type::Void | Type::Never)) != inst.result.is_none()
                             || inst.result.as_ref().is_some_and(|v| v.ty != result)
                         {
                             err(

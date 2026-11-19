@@ -67,8 +67,9 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Name(String),
-    Integer(i64),
+    Integer(crate::lexer::token::IntegerLiteral),
     Float(f64),
+    Character(char),
     String(String),
     Bool(bool),
     Call {

@@ -15,7 +15,9 @@ fn lexes_keywords_identifiers_numbers_strings_and_operators() {
             .unwrap();
     assert_eq!(tokens[0].kind, TokenKind::Keyword(Keyword::Module));
     assert_eq!(tokens[1].kind, TokenKind::Identifier("abc".into()));
-    assert!(tokens.iter().any(|t| t.kind == TokenKind::Integer(12)));
+    assert!(tokens
+        .iter()
+        .any(|t| matches!(&t.kind, TokenKind::Integer(v) if v.raw == "12" && v.radix == 10)));
     assert!(tokens.iter().any(|t| t.kind == TokenKind::Float(3.5)));
     assert!(tokens
         .iter()
@@ -77,6 +79,24 @@ fn reports_lexical_errors() {
 }
 
 #[test]
+fn lexes_unicode_character_literals_and_escapes_and_rejects_invalid_literals() {
+    let tokens = Lexer::new("'A' 'é' '\\n' '\\0' '\\u{1F642}'")
+        .tokenize()
+        .unwrap();
+    let chars = tokens
+        .iter()
+        .filter_map(|t| match t.kind {
+            TokenKind::Character(c) => Some(c),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(chars, vec!['A', 'é', '\n', '\0', '🙂']);
+    for bad in ["''", "'ab'", "'\\u{D800}'", "'\\u{110000}'", "'\\q'"] {
+        assert!(Lexer::new(bad).tokenize().is_err(), "accepted {bad:?}");
+    }
+}
+
+#[test]
 fn canonical_mode_parses_func_let_var_inference_and_constants() {
     let module = frontend::parse(
         "module m; const ANSWER: i32 = 40 + 2; func main() -> i32 { let base = 40; var result = base + 2; return result; }",
@@ -132,11 +152,59 @@ fn numeric_separators_are_checked_and_removed_from_tokens() {
     let tokens = Lexer::new("module m; func f() { let x: i32 = 1_000; }")
         .tokenize()
         .unwrap();
-    assert!(tokens.iter().any(|t| t.kind == TokenKind::Integer(1000)));
+    assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Integer(v) if v.raw == "1_000" && v.magnitude() == Some(1000))));
     assert!(Lexer::new("module m; func f() { let x: i32 = 1__0; }")
         .tokenize()
         .is_err());
     assert!(Lexer::new("module m; func f() { let x: i32 = 10_; }")
         .tokenize()
         .is_err());
+}
+
+#[test]
+fn integer_tokens_preserve_magnitudes_through_u128() {
+    let raw = "340282366920938463463374607431768211455";
+    let tokens = Lexer::new(raw).tokenize().unwrap();
+    assert!(matches!(&tokens[0].kind, TokenKind::Integer(value)
+        if value.raw == raw && value.radix == 10 && value.magnitude() == Some(u128::MAX)));
+
+    let diagnostics = frontend::analyze(&format!(
+        "module wide; func main() -> i32 {{ let value = {raw}; return 0; }}"
+    ))
+    .unwrap();
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0305"));
+}
+
+#[test]
+fn decimal_integer_lexemes_cover_u128_limit_without_host_integer_truncation() {
+    let max = "340282366920938463463374607431768211455";
+    let tokens = jahe_compiler::lexer::Lexer::new(max)
+        .tokenize()
+        .expect("u128 maximum is a valid decimal lexeme");
+    let TokenKind::Integer(integer) = &tokens[0].kind else {
+        panic!("expected integer token")
+    };
+    assert_eq!(integer.raw, max);
+    assert_eq!(integer.radix, 10);
+    assert_eq!(integer.magnitude(), Some(u128::MAX));
+
+    let beyond = "340282366920938463463374607431768211456";
+    let tokens = jahe_compiler::lexer::Lexer::new(beyond)
+        .tokenize()
+        .expect("lexing retains decimal magnitudes beyond u128 for a range diagnostic");
+    let TokenKind::Integer(integer) = &tokens[0].kind else {
+        panic!("expected integer token")
+    };
+    assert_eq!(integer.raw, beyond);
+    assert_eq!(integer.magnitude(), None);
+
+    let diagnostics = frontend::analyze(&format!(
+        "module too_wide; func main() -> i32 {{ let value = {beyond}; return 0; }}"
+    ))
+    .unwrap();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0305" && diagnostic.message.contains("outside the supported range")
+    }));
 }

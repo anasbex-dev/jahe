@@ -1,6 +1,7 @@
 use super::{
     BasicBlock, BinaryOp, BlockId, Constant, Diagnostic, ExternalFunction, Function, Instruction,
-    InstructionKind, Module, Parameter, ParameterType, Signature, Terminator, Type, Value, ValueId,
+    InstructionKind, Module, Parameter, ParameterType, Signature, Terminator, Type, UnaryOp, Value,
+    ValueId,
 };
 use crate::{
     lexer::token::Span,
@@ -12,8 +13,29 @@ use crate::{
 use std::collections::HashMap;
 
 pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
+    lower_for_target(ast, crate::target::TargetSpec::WINDOWS_X86_64_MSVC)
+}
+
+pub fn lower_for_target(
+    ast: &AstModule,
+    target: crate::target::TargetSpec,
+) -> Result<Module, Vec<Diagnostic>> {
+    if target != crate::target::TargetSpec::WINDOWS_X86_64_MSVC {
+        return Err(vec![Diagnostic {
+            code: "E0901",
+            message: format!(
+                "target `{}` is not implemented; only Windows x86_64 MSVC is supported",
+                target.triple
+            ),
+            span: ast
+                .functions
+                .first()
+                .map(|f| f.span)
+                .unwrap_or(Span { line: 1, column: 1 }),
+        }]);
+    }
     let mut resolved = ast.clone();
-    let sem = semantic::resolve(&mut resolved);
+    let sem = semantic::resolve_for_target(&mut resolved, target);
     if !sem.is_empty() {
         return Err(sem
             .into_iter()
@@ -40,17 +62,18 @@ pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
         })
         .collect::<Vec<_>>();
     let mut errs = Vec::new();
-    let constants = ast
-        .constants
-        .iter()
-        .filter_map(|c| {
-            eval_constant(&c.value).map(|value| (c.name.clone(), (map_ty(&c.ty.0), value)))
-        })
-        .collect::<HashMap<_, _>>();
+    let mut constant_values = HashMap::new();
+    let mut constants = HashMap::new();
+    for c in &ast.constants {
+        if let Some(value) = semantic::eval_const_expression_with(&c.value, &constant_values) {
+            constant_values.insert(c.name.clone(), value.clone());
+            constants.insert(c.name.clone(), (map_ty(&c.ty.0), value));
+        }
+    }
     let functions = ast
         .functions
         .iter()
-        .map(|f| FunctionLowerer::new(f, &sigs, &constants, &mut errs).lower())
+        .map(|f| FunctionLowerer::new(f, &sigs, &constants, &mut errs, target).lower())
         .collect();
     if !errs.is_empty() {
         return Err(errs);
@@ -74,14 +97,33 @@ pub fn lower(ast: &AstModule) -> Result<Module, Vec<Diagnostic>> {
 }
 fn map_ty(s: &str) -> Type {
     match s {
+        "i8" => Type::I8,
+        "i16" => Type::I16,
         "i32" => Type::I32,
         "i64" => Type::I64,
+        "i128" => Type::I128,
+        "isize" => Type::ISize,
+        "u8" => Type::U8,
+        "u16" => Type::U16,
+        "u32" => Type::U32,
+        "u64" => Type::U64,
+        "u128" => Type::U128,
+        "usize" => Type::USize,
         "f32" => Type::F32,
         "f64" => Type::F64,
         "bool" => Type::Bool,
+        "char" => Type::Char,
         "str" => Type::Str,
         "void" => Type::Void,
+        "never" => Type::Never,
         _ => unreachable!("semantic analysis accepts only known types"),
+    }
+}
+fn integer_mask(width: u32) -> u128 {
+    if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
     }
 }
 fn op(s: &str) -> BinaryOp {
@@ -105,13 +147,14 @@ fn op(s: &str) -> BinaryOp {
         _ => unreachable!(),
     }
 }
-fn eval_constant(expr: &Expr) -> Option<Constant> {
-    semantic::eval_const_expression(expr)
+fn eval_constant(expr: &Expr, values: &HashMap<String, Constant>) -> Option<Constant> {
+    semantic::eval_const_expression_with(expr, values)
 }
 #[derive(Clone)]
 struct Binding {
     value: Value,
     mutable: bool,
+    constant: Option<Constant>,
 }
 struct FunctionLowerer<'a> {
     ast: &'a AstFunction,
@@ -123,6 +166,7 @@ struct FunctionLowerer<'a> {
     next_value: u32,
     scopes: Vec<HashMap<String, Binding>>,
     ret: Type,
+    target: crate::target::TargetSpec,
 }
 impl<'a> FunctionLowerer<'a> {
     fn new(
@@ -130,6 +174,7 @@ impl<'a> FunctionLowerer<'a> {
         sigs: &'a [(String, Vec<Type>, Type)],
         constants: &'a HashMap<String, (Type, Constant)>,
         errors: &'a mut Vec<Diagnostic>,
+        target: crate::target::TargetSpec,
     ) -> Self {
         let ret = ast
             .return_type
@@ -153,6 +198,7 @@ impl<'a> FunctionLowerer<'a> {
             next_value: 0,
             scopes: vec![HashMap::new()],
             ret,
+            target,
         };
         let ps = ast
             .params
@@ -171,6 +217,7 @@ impl<'a> FunctionLowerer<'a> {
                 Binding {
                     value: v.value,
                     mutable: false,
+                    constant: None,
                 },
             );
         }
@@ -296,22 +343,38 @@ impl<'a> FunctionLowerer<'a> {
                     let b = Binding {
                         value: v,
                         mutable: *mutable,
+                        constant: None,
                     };
                     self.scopes.last_mut().unwrap().insert(name.clone(), b);
                     let _ = span;
                 }
             }
             AstStatement::Const(c) => {
-                if let Some(constant) = eval_constant(&c.value) {
+                let mut const_env = self
+                    .constants
+                    .iter()
+                    .map(|(name, (_, value))| (name.clone(), value.clone()))
+                    .collect::<HashMap<_, _>>();
+                for scope in &self.scopes {
+                    for (name, binding) in scope {
+                        if let Some(value) = &binding.constant {
+                            const_env.insert(name.clone(), value.clone());
+                        }
+                    }
+                }
+                if let Some(constant) = eval_constant(&c.value, &const_env) {
                     let ty = map_ty(&c.ty.0);
-                    if let Some(v) =
-                        self.emit(InstructionKind::Constant(constant), Some(ty), c.span)
-                    {
+                    if let Some(v) = self.emit(
+                        InstructionKind::Constant(constant.clone()),
+                        Some(ty),
+                        c.span,
+                    ) {
                         self.scopes.last_mut().unwrap().insert(
                             c.name.clone(),
                             Binding {
                                 value: v,
                                 mutable: false,
+                                constant: Some(constant),
                             },
                         );
                     }
@@ -513,10 +576,11 @@ impl<'a> FunctionLowerer<'a> {
     }
     fn while_stmt(&mut self, condition: &Expr, body: &[AstStatement], span: Span) {
         let pre = self.current.unwrap();
+        let infinite = matches!(&condition.kind, ExprKind::Bool(true));
         let header = self.block("while.header".into(), span);
         let header_index = self.index(header);
         let body_id = self.block("while.body".into(), span);
-        let exit = self.block("while.exit".into(), span);
+        let exit = (!infinite).then(|| self.block("while.exit".into(), span));
         self.current = Some(pre);
         self.branch_to(header);
         self.current = Some(self.index(header));
@@ -538,15 +602,18 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
         }
-        let Some(cond) = self.expr_expected(condition, Some(Type::Bool)) else {
-            return;
-        };
-        let cond_block = self.current.unwrap();
-        self.terminate(Terminator::ConditionalBranch {
-            condition: cond,
-            then_block: body_id,
-            else_block: exit,
-        });
+        if infinite {
+            self.branch_to(body_id);
+        } else {
+            let Some(cond) = self.expr_expected(condition, Some(Type::Bool)) else {
+                return;
+            };
+            self.terminate(Terminator::ConditionalBranch {
+                condition: cond,
+                then_block: body_id,
+                else_block: exit.unwrap(),
+            });
+        }
         let header_env = self.scopes.clone();
         self.current = Some(self.index(body_id));
         self.scopes = header_env.clone();
@@ -578,9 +645,12 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
         }
-        let _ = cond_block;
-        self.current = Some(self.index(exit));
-        self.scopes = header_env;
+        if let Some(exit) = exit {
+            self.current = Some(self.index(exit));
+            self.scopes = header_env;
+        } else {
+            self.current = None;
+        }
     }
     fn expr(&mut self, e: &Expr) -> Option<Value> {
         self.expr_expected(e, None)
@@ -594,19 +664,54 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }),
             ExprKind::Integer(v) => {
-                let inferred = if i32::try_from(*v).is_ok() {
-                    Type::I32
-                } else {
-                    Type::I64
+                let Some(magnitude) = v.magnitude() else {
+                    self.errors.push(Diagnostic {
+                        code: "E0811",
+                        message: format!("integer literal `{}` exceeds u128::MAX", v.raw),
+                        span,
+                    });
+                    return None;
                 };
-                let t = expected
-                    .filter(|t| matches!(t, Type::I32 | Type::I64))
-                    .unwrap_or(inferred);
-                self.emit(
-                    InstructionKind::Constant(Constant::Integer(*v)),
-                    Some(t),
-                    span,
-                )
+                let inferred = if magnitude <= i32::MAX as u128 {
+                    Type::I32
+                } else if magnitude <= i64::MAX as u128 {
+                    Type::I64
+                } else if magnitude <= i128::MAX as u128 {
+                    Type::I128
+                } else {
+                    Type::U128
+                };
+                let t = expected.filter(|t| t.is_integer()).unwrap_or(inferred);
+                let width = t.integer_width(self.target.pointer_width).unwrap() as u32;
+                let max = if t.is_signed_integer() {
+                    if width == 128 {
+                        i128::MAX as u128
+                    } else {
+                        (1u128 << (width - 1)) - 1
+                    }
+                } else if width == 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << width) - 1
+                };
+                if magnitude > max {
+                    self.errors.push(Diagnostic {
+                        code: "E0811",
+                        message: format!(
+                            "integer literal `{}` is outside the range of `{t}`",
+                            v.raw
+                        ),
+                        span,
+                    });
+                    return None;
+                }
+                let constant = match t {
+                    Type::I32 | Type::I64 if magnitude <= i64::MAX as u128 => {
+                        Constant::Integer(magnitude as i64)
+                    }
+                    _ => Constant::IntegerBits(magnitude),
+                };
+                self.emit(InstructionKind::Constant(constant), Some(t), span)
             }
             ExprKind::Float(v) => self.emit(
                 InstructionKind::Constant(Constant::Float(*v)),
@@ -627,11 +732,19 @@ impl<'a> FunctionLowerer<'a> {
                 Some(Type::Bool),
                 span,
             ),
+            ExprKind::Character(v) => self.emit(
+                InstructionKind::Constant(Constant::Character(*v)),
+                Some(Type::Char),
+                span,
+            ),
             ExprKind::Binary {
                 left,
                 op: oper,
                 right,
             } => {
+                if oper == "&&" || oper == "||" {
+                    return self.short_circuit(left, right, oper == "&&", span);
+                }
                 let comparison = ["==", "!=", "<", "<=", ">", ">="].contains(&oper.as_str());
                 let l = self.expr_expected(left, if comparison { None } else { expected })?;
                 let r = self.expr_expected(right, Some(l.ty))?;
@@ -664,14 +777,24 @@ impl<'a> FunctionLowerer<'a> {
                     })
                     .collect::<Option<Vec<_>>>()?;
                 let ret = signature.map(|s| s.2).unwrap_or(Type::Void);
-                self.emit(
+                let call = self.emit(
                     InstructionKind::Call {
                         function: function.clone(),
                         args: values,
                     },
-                    if ret == Type::Void { None } else { Some(ret) },
+                    if matches!(ret, Type::Void | Type::Never) {
+                        None
+                    } else {
+                        Some(ret)
+                    },
                     span,
-                )
+                );
+                if ret == Type::Never {
+                    self.terminate(Terminator::Unreachable);
+                    None
+                } else {
+                    call
+                }
             }
             ExprKind::Member { member, .. } => {
                 self.errors.push(Diagnostic {
@@ -704,8 +827,8 @@ impl<'a> FunctionLowerer<'a> {
                 )
             }
             ExprKind::Unary { op: unary, value } if unary == "-" => {
-                if let ExprKind::Integer(magnitude) = value.kind {
-                    let Some(negative) = magnitude.checked_neg() else {
+                if let ExprKind::Integer(magnitude) = &value.kind {
+                    let Some(magnitude) = magnitude.magnitude() else {
                         self.errors.push(Diagnostic {
                             code: "E0811",
                             message: "negative integer literal is outside the supported range"
@@ -714,27 +837,58 @@ impl<'a> FunctionLowerer<'a> {
                         });
                         return None;
                     };
-                    let inferred = if i32::try_from(negative).is_ok() {
+                    let inferred = if magnitude <= (i32::MAX as u128) + 1 {
                         Type::I32
-                    } else {
+                    } else if magnitude <= (i64::MAX as u128) + 1 {
                         Type::I64
+                    } else {
+                        Type::I128
                     };
                     let ty = expected
-                        .filter(|ty| matches!(ty, Type::I32 | Type::I64))
+                        .filter(|ty| ty.is_integer() && ty.is_signed_integer())
                         .unwrap_or(inferred);
-                    return self.emit(
-                        InstructionKind::Constant(Constant::Integer(negative)),
-                        Some(ty),
-                        span,
-                    );
+                    let width = ty.integer_width(self.target.pointer_width).unwrap() as u32;
+                    let abs_min = 1u128 << (width - 1);
+                    if magnitude > abs_min {
+                        self.errors.push(Diagnostic {
+                            code: "E0811",
+                            message: format!(
+                                "negative integer literal is outside the range of `{ty}`"
+                            ),
+                            span,
+                        });
+                        return None;
+                    }
+                    let bits = (0u128.wrapping_sub(magnitude)) & integer_mask(width);
+                    let constant = match ty {
+                        Type::I32 if magnitude <= (i32::MAX as u128) + 1 => {
+                            Constant::Integer((bits as u32 as i32) as i64)
+                        }
+                        Type::I64 if magnitude <= (i64::MAX as u128) + 1 => {
+                            Constant::Integer(bits as i64)
+                        }
+                        _ => Constant::IntegerBits(bits),
+                    };
+                    return self.emit(InstructionKind::Constant(constant), Some(ty), span);
                 }
                 let Some(value) = self.expr_expected(value, expected) else {
                     return None;
                 };
-                if !matches!(value.ty, Type::I32 | Type::I64) {
+                if matches!(value.ty, Type::F32 | Type::F64) {
+                    let ty = value.ty;
+                    return self.emit(
+                        InstructionKind::Unary {
+                            op: UnaryOp::Negate,
+                            value,
+                        },
+                        Some(ty),
+                        span,
+                    );
+                }
+                if !value.ty.is_integer() {
                     self.errors.push(Diagnostic {
                         code: "E0811",
-                        message: "floating unary negation lowering is not implemented".into(),
+                        message: "unary negation requires a numeric value".into(),
                         span,
                     });
                     return None;
@@ -755,6 +909,23 @@ impl<'a> FunctionLowerer<'a> {
                     span,
                 )
             }
+            ExprKind::Unary { op: unary, value } if unary == "!" => {
+                let value = self.expr_expected(value, Some(Type::Bool))?;
+                let falsity = self.emit(
+                    InstructionKind::Constant(Constant::Bool(false)),
+                    Some(Type::Bool),
+                    span,
+                )?;
+                self.emit(
+                    InstructionKind::Binary {
+                        op: BinaryOp::Equal,
+                        left: value,
+                        right: falsity,
+                    },
+                    Some(Type::Bool),
+                    span,
+                )
+            }
             ExprKind::Unary { op: unary, .. } => {
                 self.errors.push(Diagnostic {
                     code: "E0810",
@@ -764,5 +935,48 @@ impl<'a> FunctionLowerer<'a> {
                 None
             }
         }
+    }
+
+    fn short_circuit(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        is_and: bool,
+        span: Span,
+    ) -> Option<Value> {
+        let lhs = self.expr_expected(left, Some(Type::Bool))?;
+        let pre = self.current?;
+        let rhs_id = self.block("logic.rhs".into(), span);
+        let short_id = self.block("logic.short".into(), span);
+        let merge_id = self.block("logic.merge".into(), span);
+        self.current = Some(pre);
+        self.terminate(Terminator::ConditionalBranch {
+            condition: lhs,
+            then_block: if is_and { rhs_id } else { short_id },
+            else_block: if is_and { short_id } else { rhs_id },
+        });
+        self.current = Some(self.index(short_id));
+        let short_value = self.emit(
+            InstructionKind::Constant(Constant::Bool(!is_and)),
+            Some(Type::Bool),
+            span,
+        )?;
+        let short_end = BlockId(self.current? as u32);
+        self.branch_to(merge_id);
+        self.current = Some(self.index(rhs_id));
+        let rhs_value = self.expr_expected(right, Some(Type::Bool))?;
+        let rhs_end = BlockId(self.current? as u32);
+        self.branch_to(merge_id);
+        self.current = Some(self.index(merge_id));
+        let result = self.value(Type::Bool, span);
+        let merge_index = self.index(merge_id);
+        self.blocks[merge_index].instructions.push(Instruction {
+            result: Some(result.clone()),
+            kind: InstructionKind::Phi {
+                incoming: vec![(short_end, short_value), (rhs_end, rhs_value)],
+            },
+            span,
+        });
+        Some(result)
     }
 }

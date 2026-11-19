@@ -361,6 +361,23 @@ impl Engine<'_> {
                         self.read(&frame, right)?,
                         inst.span,
                     )?),
+                    InstructionKind::Unary {
+                        op: ir::UnaryOp::Negate,
+                        value,
+                    } => {
+                        let value = self.read(&frame, value)?;
+                        Some(match value {
+                            RuntimeValue::F32(v) => RuntimeValue::F32(-v),
+                            RuntimeValue::F64(v) => RuntimeValue::F64(-v),
+                            _ => {
+                                return Err(RuntimeError::new(
+                                    RuntimeErrorKind::InvalidValue,
+                                    "invalid operand to floating negation",
+                                    Some(inst.span),
+                                ))
+                            }
+                        })
+                    }
                     InstructionKind::Cast { value, target } => {
                         Some(cast(self.read(&frame, value)?, *target, inst.span)?)
                     }
@@ -472,10 +489,31 @@ fn constant(c: &Constant, ty: Option<Type>, span: Span) -> Result<RuntimeValue, 
             })
         }
         (Constant::Integer(v), Some(Type::I64)) => Ok(RuntimeValue::I64(*v)),
+        (Constant::Integer(v), Some(ty)) if ty.is_integer() => {
+            integer_from_i128(i128::from(*v), ty).map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorKind::InvalidValue,
+                    format!("integer constant out of `{ty}` range"),
+                    Some(span),
+                )
+            })
+        }
+        (Constant::IntegerBits(bits), Some(ty)) if ty.is_integer() => {
+            let width = ty.integer_width(64).unwrap();
+            if width < 128 && (*bits >> width) != 0 {
+                return Err(RuntimeError::new(
+                    RuntimeErrorKind::InvalidValue,
+                    format!("integer bit pattern exceeds `{ty}` width"),
+                    Some(span),
+                ));
+            }
+            Ok(integer_value(*bits, ty))
+        }
         (Constant::Float(v), Some(Type::F32)) => Ok(RuntimeValue::F32(*v as f32)),
         (Constant::Float(v), Some(Type::F64)) => Ok(RuntimeValue::F64(*v)),
         (Constant::String(v), Some(Type::Str)) => Ok(RuntimeValue::Str(v.clone())),
         (Constant::Bool(v), Some(Type::Bool)) => Ok(RuntimeValue::Bool(*v)),
+        (Constant::Character(v), Some(Type::Char)) => Ok(RuntimeValue::Char(*v)),
         _ => Err(RuntimeError::new(
             RuntimeErrorKind::InvalidValue,
             "constant/type mismatch",
@@ -492,6 +530,26 @@ fn cast(value: RuntimeValue, target: Type, span: Span) -> Result<RuntimeValue, R
             Some(span),
         )
     };
+    if target.is_integer() {
+        if let Some((bits, source)) = integer_parts(&value) {
+            return cast_integer(bits, source, target).map_err(|_| invalid());
+        }
+    }
+    if matches!(target, Type::F32 | Type::F64) {
+        if let Some((bits, source)) = integer_parts(&value) {
+            let width = source.integer_width(64).unwrap();
+            let number = if source.is_signed_integer() {
+                signed_from_bits(bits, width) as f64
+            } else {
+                (bits & integer_mask(width)) as f64
+            };
+            return match target {
+                Type::F32 => Ok(V::F32(number as f32)),
+                Type::F64 => Ok(V::F64(number)),
+                _ => unreachable!(),
+            };
+        }
+    }
     match (value, target) {
         (V::I32(v), Type::I32) => Ok(V::I32(v)),
         (V::I32(v), Type::I64) => Ok(V::I64(i64::from(v))),
@@ -503,14 +561,40 @@ fn cast(value: RuntimeValue, target: Type, span: Span) -> Result<RuntimeValue, R
         (V::I64(v), Type::F64) => Ok(V::F64(v as f64)),
         (V::F32(v), Type::I32) => float_to_i32(f64::from(v), span).map(V::I32),
         (V::F32(v), Type::I64) => float_to_i64(f64::from(v), span).map(V::I64),
+        (V::F32(v), target) if target.is_integer() => float_to_integer(f64::from(v), target, span),
         (V::F32(v), Type::F32) => Ok(V::F32(v)),
         (V::F32(v), Type::F64) => Ok(V::F64(f64::from(v))),
         (V::F64(v), Type::I32) => float_to_i32(v, span).map(V::I32),
         (V::F64(v), Type::I64) => float_to_i64(v, span).map(V::I64),
+        (V::F64(v), target) if target.is_integer() => float_to_integer(v, target, span),
         (V::F64(v), Type::F32) => Ok(V::F32(v as f32)),
         (V::F64(v), Type::F64) => Ok(V::F64(v)),
         _ => Err(invalid()),
     }
+}
+fn float_to_integer(value: f64, target: Type, span: Span) -> Result<RuntimeValue, RuntimeError> {
+    let width = target.integer_width(64).unwrap();
+    let valid = if target.is_signed_integer() {
+        value.is_finite()
+            && value >= -2f64.powi(i32::from(width - 1))
+            && value < 2f64.powi(i32::from(width - 1))
+    } else {
+        value.is_finite() && value >= 0.0 && value < 2f64.powi(i32::from(width))
+    };
+    if !valid {
+        return Err(RuntimeError::new(
+            RuntimeErrorKind::InvalidCast,
+            format!("float is outside the range of `{target}`"),
+            Some(span),
+        ));
+    }
+    let truncated = value.trunc();
+    let bits = if target.is_signed_integer() {
+        (truncated as i128) as u128
+    } else {
+        truncated as u128
+    };
+    Ok(integer_value(bits, target))
 }
 fn float_to_i32(value: f64, span: Span) -> Result<i32, RuntimeError> {
     if value.is_finite() && value >= i32::MIN as f64 && value < (i32::MAX as f64) + 1.0 {
@@ -545,11 +629,19 @@ fn binary(
     match (left, right) {
         (V::I32(a), V::I32(b)) => integer32(op, a, b, span),
         (V::I64(a), V::I64(b)) => integer64(op, a, b, span),
+        (V::Integer { bits: a, ty: ta }, V::Integer { bits: b, ty: tb }) if ta == tb => {
+            integer_wide(op, a, b, ta, span)
+        }
         (V::F32(a), V::F32(b)) => float32(op, a, b, span),
         (V::F64(a), V::F64(b)) => float64(op, a, b, span),
         (V::Bool(a), V::Bool(b)) => compare(op, a.cmp(&b))
             .map(V::Bool)
             .ok_or_else(|| invalid_binary(span)),
+        (V::Char(a), V::Char(b)) => match op {
+            BinaryOp::Equal => Ok(V::Bool(a == b)),
+            BinaryOp::NotEqual => Ok(V::Bool(a != b)),
+            _ => Err(invalid_binary(span)),
+        },
         (V::Str(a), V::Str(b)) => compare(op, a.cmp(&b))
             .map(V::Bool)
             .ok_or_else(|| invalid_binary(span)),
@@ -560,6 +652,221 @@ fn invalid_binary(span: Span) -> RuntimeError {
     RuntimeError::new(
         RuntimeErrorKind::InvalidValue,
         "binary operand type mismatch",
+        Some(span),
+    )
+}
+
+fn integer_mask(width: u8) -> u128 {
+    if width == 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+fn signed_from_bits(bits: u128, width: u8) -> i128 {
+    if width == 128 {
+        bits as i128
+    } else {
+        let mask = integer_mask(width);
+        let value = bits & mask;
+        let sign = 1u128 << (width - 1);
+        if value & sign == 0 {
+            value as i128
+        } else {
+            (value | !mask) as i128
+        }
+    }
+}
+fn integer_parts(value: &RuntimeValue) -> Option<(u128, Type)> {
+    match value {
+        RuntimeValue::I32(v) => Some((*v as u32 as u128, Type::I32)),
+        RuntimeValue::I64(v) => Some((*v as u64 as u128, Type::I64)),
+        RuntimeValue::Integer { bits, ty } => Some((*bits, *ty)),
+        _ => None,
+    }
+}
+fn integer_value(bits: u128, ty: Type) -> RuntimeValue {
+    let width = ty.integer_width(64).unwrap();
+    let bits = bits & integer_mask(width);
+    match ty {
+        Type::I32 => RuntimeValue::I32(bits as u32 as i32),
+        Type::I64 => RuntimeValue::I64(bits as u64 as i64),
+        _ => RuntimeValue::Integer { bits, ty },
+    }
+}
+fn integer_from_i128(value: i128, ty: Type) -> Result<RuntimeValue, ()> {
+    let width = ty.integer_width(64).ok_or(())?;
+    let bits = if ty.is_signed_integer() {
+        let min = if width == 128 {
+            i128::MIN
+        } else {
+            -(1i128 << (width - 1))
+        };
+        let max = if width == 128 {
+            i128::MAX
+        } else {
+            (1i128 << (width - 1)) - 1
+        };
+        if value < min || value > max {
+            return Err(());
+        }
+        value as u128
+    } else {
+        if value < 0 || (value as u128) > integer_mask(width) {
+            return Err(());
+        }
+        value as u128
+    };
+    Ok(integer_value(bits, ty))
+}
+fn cast_integer(bits: u128, source: Type, target: Type) -> Result<RuntimeValue, ()> {
+    let sw = source.integer_width(64).ok_or(())?;
+    let tw = target.integer_width(64).ok_or(())?;
+    let source_bits = bits & integer_mask(sw);
+    if source.is_signed_integer() {
+        integer_from_i128(signed_from_bits(source_bits, sw), target)
+    } else {
+        let value = source_bits;
+        if target.is_signed_integer() {
+            let max = if tw == 128 {
+                i128::MAX as u128
+            } else {
+                (1u128 << (tw - 1)) - 1
+            };
+            if value > max {
+                return Err(());
+            }
+        } else if value > integer_mask(tw) {
+            return Err(());
+        }
+        Ok(integer_value(value, target))
+    }
+}
+fn integer_wide(
+    op: BinaryOp,
+    a: u128,
+    b: u128,
+    ty: Type,
+    span: Span,
+) -> Result<RuntimeValue, RuntimeError> {
+    let width = ty.integer_width(64).unwrap();
+    let mask = integer_mask(width);
+    let a = a & mask;
+    let b = b & mask;
+    let signed = ty.is_signed_integer();
+    let out = if matches!(
+        op,
+        BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual
+    ) {
+        let ord = if signed {
+            signed_from_bits(a, width).cmp(&signed_from_bits(b, width))
+        } else {
+            a.cmp(&b)
+        };
+        return compare(op, ord)
+            .map(RuntimeValue::Bool)
+            .ok_or_else(|| invalid_binary(span));
+    } else if matches!(op, BinaryOp::ShiftLeft | BinaryOp::ShiftRight) {
+        let count = if signed {
+            signed_from_bits(b, width)
+        } else {
+            i128::try_from(b).unwrap_or(i128::MAX)
+        };
+        if count < 0 || count >= i128::from(width) {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::InvalidShift,
+                format!("shift count must be between 0 and {}", width - 1),
+                Some(span),
+            ));
+        }
+        let count = count as u32;
+        if op == BinaryOp::ShiftRight {
+            if signed {
+                (signed_from_bits(a, width) >> count) as u128 & mask
+            } else {
+                a >> count
+            }
+        } else {
+            let shifted = a.wrapping_shl(count) & mask;
+            let overflow = if signed {
+                ((signed_from_bits(shifted, width) >> count) as u128 & mask) != a
+            } else {
+                (shifted >> count) != a
+            };
+            if overflow {
+                return Err(integer_overflow(ty, span));
+            }
+            shifted
+        }
+    } else if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor) {
+        match op {
+            BinaryOp::BitAnd => a & b,
+            BinaryOp::BitOr => a | b,
+            _ => a ^ b,
+        }
+    } else if signed {
+        let x = signed_from_bits(a, width);
+        let y = signed_from_bits(b, width);
+        if matches!(op, BinaryOp::Div | BinaryOp::Rem) && y == 0 {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::DivisionByZero,
+                "integer division by zero",
+                Some(span),
+            ));
+        }
+        let value = match op {
+            BinaryOp::Add => x.checked_add(y),
+            BinaryOp::Sub => x.checked_sub(y),
+            BinaryOp::Mul => x.checked_mul(y),
+            BinaryOp::Div => x.checked_div(y),
+            BinaryOp::Rem => x.checked_rem(y),
+            _ => None,
+        }
+        .ok_or_else(|| integer_overflow(ty, span))?;
+        let min = if width == 128 {
+            i128::MIN
+        } else {
+            -(1i128 << (width - 1))
+        };
+        let max = if width == 128 {
+            i128::MAX
+        } else {
+            (1i128 << (width - 1)) - 1
+        };
+        if value < min || value > max {
+            return Err(integer_overflow(ty, span));
+        }
+        value as u128 & mask
+    } else {
+        if matches!(op, BinaryOp::Div | BinaryOp::Rem) && b == 0 {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::DivisionByZero,
+                "integer division by zero",
+                Some(span),
+            ));
+        }
+        match op {
+            BinaryOp::Add => a.checked_add(b),
+            BinaryOp::Sub => a.checked_sub(b),
+            BinaryOp::Mul => a.checked_mul(b),
+            BinaryOp::Div => Some(a / b),
+            BinaryOp::Rem => Some(a % b),
+            _ => None,
+        }
+        .filter(|value| *value <= mask)
+        .ok_or_else(|| integer_overflow(ty, span))?
+    };
+    Ok(integer_value(out, ty))
+}
+fn integer_overflow(ty: Type, span: Span) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorKind::IntegerOverflow,
+        format!("{ty} arithmetic overflow"),
         Some(span),
     )
 }

@@ -67,7 +67,7 @@ impl BuiltinRegistry {
             .signature()
             .params
             .iter()
-            .any(|p| matches!(p, ParameterType::Exact(Type::Void)))
+            .any(|p| matches!(p, ParameterType::Exact(Type::Void | Type::Never)))
         {
             return Err(RegistrationError {
                 kind: RegistrationErrorKind::InvalidSignature,
