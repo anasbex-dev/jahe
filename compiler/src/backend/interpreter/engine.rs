@@ -824,6 +824,7 @@ fn integer_wide(
             BinaryOp::Sub => x.checked_sub(y),
             BinaryOp::Mul => x.checked_mul(y),
             BinaryOp::Div => x.checked_div(y),
+            BinaryOp::Rem if width == 128 && x == i128::MIN && y == -1 => Some(0),
             BinaryOp::Rem => x.checked_rem(y),
             _ => None,
         }
@@ -902,7 +903,11 @@ fn integer32(op: BinaryOp, a: i32, b: i32, s: Span) -> Result<RuntimeValue, Runt
         }
         BinaryOp::Rem => {
             div_zero(b, 0, s)?;
-            a.checked_rem(b)
+            if a == i32::MIN && b == -1 {
+                Some(0)
+            } else {
+                a.checked_rem(b)
+            }
         }
         BinaryOp::BitAnd => Some(a & b),
         BinaryOp::BitOr => Some(a | b),
@@ -949,7 +954,11 @@ fn integer64(op: BinaryOp, a: i64, b: i64, s: Span) -> Result<RuntimeValue, Runt
         }
         BinaryOp::Rem => {
             div_zero(b, 0, s)?;
-            a.checked_rem(b)
+            if a == i64::MIN && b == -1 {
+                Some(0)
+            } else {
+                a.checked_rem(b)
+            }
         }
         BinaryOp::BitAnd => Some(a & b),
         BinaryOp::BitOr => Some(a | b),

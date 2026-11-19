@@ -65,9 +65,13 @@ pub fn lower_for_target(
     let mut constant_values = HashMap::new();
     let mut constants = HashMap::new();
     for c in &ast.constants {
-        if let Some(value) = semantic::eval_const_expression_with(&c.value, &constant_values) {
-            constant_values.insert(c.name.clone(), value.clone());
-            constants.insert(c.name.clone(), (map_ty(&c.ty.0), value));
+        let ir_ty = map_ty(&c.ty.0);
+        let sem_ty = semantic::Ty::parse(&c.ty).expect("semantic analysis accepted constant type");
+        if let Ok(typed) =
+            semantic::eval_typed_constant(&c.value, sem_ty, &constant_values, target.pointer_width)
+        {
+            constant_values.insert(c.name.clone(), typed.clone());
+            constants.insert(c.name.clone(), (ir_ty, typed.value));
         }
     }
     let functions = ast
@@ -119,6 +123,10 @@ fn map_ty(s: &str) -> Type {
         _ => unreachable!("semantic analysis accepts only known types"),
     }
 }
+fn semantic_ty(ty: Type) -> semantic::Ty {
+    semantic::Ty::parse(&crate::parser::ast::Type(ty.to_string()))
+        .expect("IR scalar type has semantic counterpart")
+}
 fn integer_mask(width: u32) -> u128 {
     if width == 128 {
         u128::MAX
@@ -147,8 +155,15 @@ fn op(s: &str) -> BinaryOp {
         _ => unreachable!(),
     }
 }
-fn eval_constant(expr: &Expr, values: &HashMap<String, Constant>) -> Option<Constant> {
-    semantic::eval_const_expression_with(expr, values)
+fn eval_constant(
+    expr: &Expr,
+    ty: &crate::semantic::Ty,
+    values: &HashMap<String, semantic::TypedConstant>,
+    pointer_width: u8,
+) -> Option<Constant> {
+    semantic::eval_typed_constant(expr, *ty, values, pointer_width)
+        .ok()
+        .map(|typed| typed.value)
 }
 #[derive(Clone)]
 struct Binding {
@@ -353,17 +368,34 @@ impl<'a> FunctionLowerer<'a> {
                 let mut const_env = self
                     .constants
                     .iter()
-                    .map(|(name, (_, value))| (name.clone(), value.clone()))
+                    .map(|(name, (ty, value))| {
+                        (
+                            name.clone(),
+                            semantic::TypedConstant {
+                                ty: semantic_ty(*ty),
+                                value: value.clone(),
+                            },
+                        )
+                    })
                     .collect::<HashMap<_, _>>();
                 for scope in &self.scopes {
                     for (name, binding) in scope {
                         if let Some(value) = &binding.constant {
-                            const_env.insert(name.clone(), value.clone());
+                            const_env.insert(
+                                name.clone(),
+                                semantic::TypedConstant {
+                                    ty: semantic_ty(binding.value.ty),
+                                    value: value.clone(),
+                                },
+                            );
                         }
                     }
                 }
-                if let Some(constant) = eval_constant(&c.value, &const_env) {
-                    let ty = map_ty(&c.ty.0);
+                let ty = map_ty(&c.ty.0);
+                let sem_ty = semantic::Ty::parse(&c.ty).unwrap();
+                if let Some(constant) =
+                    eval_constant(&c.value, &sem_ty, &const_env, self.target.pointer_width)
+                {
                     if let Some(v) = self.emit(
                         InstructionKind::Constant(constant.clone()),
                         Some(ty),

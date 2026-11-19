@@ -11,12 +11,20 @@ use jahe_compiler::{
     frontend,
     ir::{self, ExternalFunction, InstructionKind, Signature, Terminator, Type},
 };
+mod common;
 
 fn compile(source: &str) -> ir::Module {
     frontend::lower_to_ir_with_mode(source, jahe_compiler::parser::SyntaxMode::Legacy).unwrap()
 }
 fn run(source: &str) -> jahe_compiler::backend::interpreter::ExecutionResult {
     Interpreter::default().execute(&compile(source)).unwrap()
+}
+
+#[test]
+fn interpreter_matches_constant_expectations_for_scalar_operator_and_cast_matrix() {
+    let source = common::scalar_operator_cast_matrix();
+    let result = run(&source);
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(0)));
 }
 
 #[test]
@@ -104,7 +112,8 @@ fn integer_remainder_runs_in_interpreter() {
         "module remainder; func main() -> i32 { return (-2147483648) % -1; }",
     )
     .unwrap();
-    assert!(Interpreter::default().execute(&signed_overflow).is_err());
+    let result = Interpreter::default().execute(&signed_overflow).unwrap();
+    assert_eq!(result.return_value, Some(RuntimeValue::I32(0)));
 }
 
 #[test]
@@ -134,7 +143,7 @@ fn explicit_numeric_casts_run_and_reject_out_of_range_values() {
     .unwrap_err();
     assert!(compile_time_invalid
         .iter()
-        .any(|diagnostic| diagnostic.code == "E0304"));
+        .any(|diagnostic| diagnostic.code == "E0708" && diagnostic.message.contains("cast")));
 }
 
 #[test]

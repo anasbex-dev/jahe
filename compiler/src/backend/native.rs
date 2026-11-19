@@ -89,6 +89,22 @@ impl NativeBackend {
                     ),
                 ));
             }
+            for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+                if let InstructionKind::Cast { value, target } = &instruction.kind {
+                    let wide_integer = matches!(value.ty, Type::I128 | Type::U128);
+                    let float = matches!(value.ty, Type::F32 | Type::F64)
+                        || matches!(target, Type::F32 | Type::F64);
+                    let target_wide = matches!(target, Type::I128 | Type::U128);
+                    if (wide_integer && float)
+                        || (target_wide && matches!(value.ty, Type::F32 | Type::F64))
+                    {
+                        return Err(unsupported(
+                            instruction.span,
+                            format!("native cast from `{}` to `{target}` is not implemented for Windows x64", value.ty),
+                        ));
+                    }
+                }
+            }
             let signature = function_signature(&object, function);
             let id = object
                 .declare_function(
@@ -269,7 +285,7 @@ impl NativeBackend {
             builder.finalize(frontend_config);
             object
                 .define_function(func_id, &mut ctx)
-                .map_err(|e| native_error(Some(function), e.to_string()))?;
+                .map_err(|e| native_error(Some(function), format!("{e:?}")))?;
         }
         object
             .finish()
@@ -408,7 +424,12 @@ fn emit_instruction(
                 .ty;
             let value = match (constant, ty) {
                 (Constant::Integer(i), ty) if ty.is_integer() => {
-                    builder.ins().iconst(clif_type(ty, pointer_type)?, *i)
+                    let clty = clif_type(ty, pointer_type)?;
+                    if clty.bits() <= 64 {
+                        builder.ins().iconst(clty, *i)
+                    } else {
+                        emit_integer_constant(builder, clty, *i as u128)
+                    }
                 }
                 (Constant::IntegerBits(bits), ty) if ty.is_integer() => {
                     let clty = clif_type(ty, pointer_type)?;
@@ -508,14 +529,19 @@ fn emit_instruction(
                         let minus_one = builder.ins().iconst(clif_type(left.ty, pointer_type)?, -1);
                         let lhs_min = builder.ins().icmp(IntCC::Equal, lhs, min_value);
                         let rhs_negative_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
-                        let overflow = builder.ins().band(lhs_min, rhs_negative_one);
-                        builder
-                            .ins()
-                            .trapnz(overflow, cranelift_codegen::ir::TrapCode::unwrap_user(2));
-                        if *op == Rem {
-                            builder.ins().srem(lhs, rhs)
-                        } else {
+                        if *op == Div {
+                            let overflow = builder.ins().band(lhs_min, rhs_negative_one);
+                            builder
+                                .ins()
+                                .trapnz(overflow, cranelift_codegen::ir::TrapCode::unwrap_user(2));
                             builder.ins().sdiv(lhs, rhs)
+                        } else {
+                            let overflow = builder.ins().band(lhs_min, rhs_negative_one);
+                            let zero = builder.ins().iconst(clif_type(left.ty, pointer_type)?, 0);
+                            let one = builder.ins().iconst(clif_type(left.ty, pointer_type)?, 1);
+                            let safe_lhs = builder.ins().select(overflow, zero, lhs);
+                            let safe_rhs = builder.ins().select(overflow, one, rhs);
+                            builder.ins().srem(safe_lhs, safe_rhs)
                         }
                     }
                     BitAnd if left.ty != Type::Bool => builder.ins().band(lhs, rhs),
@@ -703,6 +729,11 @@ fn native_integer_binary(
     let trap = cranelift_codegen::ir::TrapCode::unwrap_user(2);
     let value = match op {
         Add | Sub | Mul => {
+            if op == Mul && width == 128 {
+                let (result, overflow) = native_mul_overflow128(builder, lhs, rhs, signed);
+                builder.ins().trapnz(overflow, trap);
+                return Ok(result);
+            }
             let (result, overflow) = match (op, signed) {
                 (Add, true) => builder.ins().sadd_overflow(lhs, rhs),
                 (Sub, true) => builder.ins().ssub_overflow(lhs, rhs),
@@ -727,8 +758,10 @@ fn native_integer_binary(
                     let minus_one = emit_integer_constant(builder, clty, u128::MAX);
                     let is_min = builder.ins().icmp(IntCC::Equal, lhs, minimum);
                     let is_minus_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
-                    let overflow = builder.ins().band(is_min, is_minus_one);
-                    builder.ins().trapnz(overflow, trap);
+                    if op == Div {
+                        let overflow = builder.ins().band(is_min, is_minus_one);
+                        builder.ins().trapnz(overflow, trap);
+                    }
                     let lhs_negative = builder.ins().icmp(IntCC::SignedLessThan, lhs, zero);
                     let rhs_negative = builder.ins().icmp(IntCC::SignedLessThan, rhs, zero);
                     let abs_lhs = builder.ins().isub(zero, lhs);
@@ -754,12 +787,16 @@ fn native_integer_binary(
                 let minus_one = emit_integer_constant(builder, clty, u128::MAX);
                 let is_min = builder.ins().icmp(IntCC::Equal, lhs, min);
                 let is_negative_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
-                let overflow = builder.ins().band(is_min, is_negative_one);
-                builder.ins().trapnz(overflow, trap);
                 if op == Div {
+                    let overflow = builder.ins().band(is_min, is_negative_one);
+                    builder.ins().trapnz(overflow, trap);
                     builder.ins().sdiv(lhs, rhs)
                 } else {
-                    builder.ins().srem(lhs, rhs)
+                    let overflow = builder.ins().band(is_min, is_negative_one);
+                    let one = emit_integer_constant(builder, clty, 1);
+                    let safe_lhs = builder.ins().select(overflow, zero, lhs);
+                    let safe_rhs = builder.ins().select(overflow, one, rhs);
+                    builder.ins().srem(safe_lhs, safe_rhs)
                 }
             } else if op == Div {
                 builder.ins().udiv(lhs, rhs)
@@ -828,6 +865,71 @@ fn native_integer_binary(
     };
     let _ = span;
     Ok(value)
+}
+
+fn native_mul_overflow128(
+    builder: &mut FunctionBuilder<'_>,
+    lhs: ClifValue,
+    rhs: ClifValue,
+    signed: bool,
+) -> (ClifValue, ClifValue) {
+    let zero = emit_integer_constant(builder, types::I128, 0);
+    let lhs_negative = if signed {
+        builder.ins().icmp(IntCC::SignedLessThan, lhs, zero)
+    } else {
+        builder.ins().iconst(types::I8, 0)
+    };
+    let rhs_negative = if signed {
+        builder.ins().icmp(IntCC::SignedLessThan, rhs, zero)
+    } else {
+        builder.ins().iconst(types::I8, 0)
+    };
+    let lhs_magnitude = if signed {
+        let negated = builder.ins().isub(zero, lhs);
+        builder.ins().select(lhs_negative, negated, lhs)
+    } else {
+        lhs
+    };
+    let rhs_magnitude = if signed {
+        let negated = builder.ins().isub(zero, rhs);
+        builder.ins().select(rhs_negative, negated, rhs)
+    } else {
+        rhs
+    };
+
+    // Cranelift's overflow multiply instructions do not accept i128. The wrapped
+    // product divided by a nonzero magnitude recovers the other factor exactly
+    // iff the full unsigned product fit in 128 bits.
+    let magnitude_product = builder.ins().imul(lhs_magnitude, rhs_magnitude);
+    let lhs_is_zero = builder.ins().icmp(IntCC::Equal, lhs_magnitude, zero);
+    // The restoring divider has no zero-divisor meaning. Use one for the
+    // unused check in the zero-product case, then mask its result below.
+    let one = emit_integer_constant(builder, types::I128, 1);
+    let check_divisor = builder.ins().select(lhs_is_zero, one, lhs_magnitude);
+    let (quotient, _) = native_udivrem128(builder, magnitude_product, check_divisor);
+    let quotient_mismatch = builder.ins().icmp(IntCC::NotEqual, quotient, rhs_magnitude);
+    // `bnot` is a bitwise complement, not boolean negation: complements of a
+    // 0/1 predicate are nonzero in both cases. Normalize predicates by comparing.
+    let zero_bool = builder.ins().iconst(types::I8, 0);
+    let lhs_nonzero = builder.ins().icmp(IntCC::Equal, lhs_is_zero, zero_bool);
+    let high_overflow = builder.ins().band(lhs_nonzero, quotient_mismatch);
+
+    let overflow = if signed {
+        let negative_result = builder.ins().bxor(lhs_negative, rhs_negative);
+        let positive_max = emit_integer_constant(builder, types::I128, i128::MAX as u128);
+        let negative_max = emit_integer_constant(builder, types::I128, 1u128 << 127);
+        let limit = builder
+            .ins()
+            .select(negative_result, negative_max, positive_max);
+        let bound_overflow =
+            builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, magnitude_product, limit);
+        builder.ins().bor(high_overflow, bound_overflow)
+    } else {
+        high_overflow
+    };
+    (builder.ins().imul(lhs, rhs), overflow)
 }
 
 fn emit_integer_constant(
@@ -909,8 +1011,7 @@ fn native_cast(
         (true, false, true, false) if source == I64 && target == I32 => {
             let narrowed = builder.ins().ireduce(types::I32, value);
             let restored = builder.ins().sextend(types::I64, narrowed);
-            let valid = builder.ins().icmp(IntCC::Equal, restored, value);
-            let invalid = builder.ins().bnot(valid);
+            let invalid = builder.ins().icmp(IntCC::NotEqual, restored, value);
             builder
                 .ins()
                 .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
@@ -951,14 +1052,22 @@ fn native_cast(
             builder
                 .ins()
                 .trapnz(invalid, cranelift_codegen::ir::TrapCode::unwrap_user(4));
-            if target.is_signed_integer() {
-                builder
-                    .ins()
-                    .fcvt_to_sint(clif_type(target, pointer_type)?, float64)
+            let conversion_type = if width < 32 {
+                types::I32
             } else {
+                clif_type(target, pointer_type)?
+            };
+            let converted = if target.is_signed_integer() {
+                builder.ins().fcvt_to_sint(conversion_type, float64)
+            } else {
+                builder.ins().fcvt_to_uint(conversion_type, float64)
+            };
+            if width < 32 {
                 builder
                     .ins()
-                    .fcvt_to_uint(clif_type(target, pointer_type)?, float64)
+                    .ireduce(clif_type(target, pointer_type)?, converted)
+            } else {
+                converted
             }
         }
         (false, true, false, true) if source == F32 && target == F64 => {
@@ -967,6 +1076,7 @@ fn native_cast(
         (false, true, false, true) if source == F64 && target == F32 => {
             builder.ins().fdemote(types::F32, value)
         }
+        (false, true, false, true) if source == target => value,
         _ => {
             return Err(unsupported(
                 span,
@@ -1010,8 +1120,7 @@ fn native_integer_cast(
         } else {
             builder.ins().uextend(source_ty, narrowed)
         };
-        let valid = builder.ins().icmp(IntCC::Equal, restored, value);
-        let invalid = builder.ins().bnot(valid);
+        let invalid = builder.ins().icmp(IntCC::NotEqual, restored, value);
         builder.ins().trapnz(invalid, trap);
         narrowed
     } else {

@@ -3,6 +3,15 @@ use crate::{
     parser::ast::{Constant, Expr, ExprKind, Function, Module, Statement, Type},
 };
 use std::collections::{HashMap, HashSet};
+mod const_eval;
+pub(crate) fn eval_typed_constant(
+    expr: &Expr,
+    expected: Ty,
+    constants: &HashMap<String, TypedConstant>,
+    pointer_width: u8,
+) -> Result<TypedConstant, ConstEvalError> {
+    const_eval::evaluate(expr, Some(expected), constants, pointer_width)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDiagnostic {
@@ -33,6 +42,41 @@ impl SemanticDiagnostic {
     }
 }
 
+fn const_eval_diagnostic(error: ConstEvalError) -> SemanticDiagnostic {
+    let (code, category) = match &error.kind {
+        ConstEvalErrorKind::IntegerOverflow => ("E0703", "integer overflow"),
+        ConstEvalErrorKind::IntegerUnderflow => ("E0704", "integer underflow"),
+        ConstEvalErrorKind::DivisionByZero => ("E0705", "division by zero"),
+        ConstEvalErrorKind::SignedDivisionOverflow => {
+            ("E0706", "signed minimum divided by negative one")
+        }
+        ConstEvalErrorKind::InvalidShift => ("E0707", "invalid shift count"),
+        ConstEvalErrorKind::OutOfRangeCast => ("E0708", "out-of-range constant cast"),
+        ConstEvalErrorKind::InvalidTypeOperation => {
+            ("E0709", "invalid constant operation for type")
+        }
+        ConstEvalErrorKind::InvalidDependency(_) => ("E0710", "invalid constant dependency"),
+        ConstEvalErrorKind::DependencyCycle => ("E0702", "constant dependency cycle"),
+        ConstEvalErrorKind::UnsupportedExpression => ("E0701", "unsupported constant expression"),
+    };
+    let type_detail = error
+        .ty
+        .map(|ty| format!(" for `{ty}`"))
+        .unwrap_or_default();
+    let dependency = match &error.kind {
+        ConstEvalErrorKind::InvalidDependency(name) => format!(" `{name}`"),
+        _ => String::new(),
+    };
+    SemanticDiagnostic::new(
+        code,
+        format!(
+            "{category} in constant operation `{}`{type_detail}{dependency}",
+            error.operation
+        ),
+        error.span,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ty {
     I8,
@@ -56,7 +100,7 @@ pub enum Ty {
     Never,
 }
 impl Ty {
-    fn parse(t: &Type) -> Option<Self> {
+    pub(crate) fn parse(t: &Type) -> Option<Self> {
         match t.0.as_str() {
             "i8" => Some(Self::I8),
             "i16" => Some(Self::I16),
@@ -80,6 +124,31 @@ impl Ty {
             _ => None,
         }
     }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TypedConstant {
+    pub(crate) ty: Ty,
+    pub(crate) value: crate::ir::Constant,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConstEvalErrorKind {
+    IntegerOverflow,
+    IntegerUnderflow,
+    DivisionByZero,
+    SignedDivisionOverflow,
+    InvalidShift,
+    OutOfRangeCast,
+    InvalidTypeOperation,
+    InvalidDependency(String),
+    DependencyCycle,
+    UnsupportedExpression,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConstEvalError {
+    pub(crate) kind: ConstEvalErrorKind,
+    pub(crate) span: Span,
+    pub(crate) operation: String,
+    pub(crate) ty: Option<Ty>,
 }
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -216,25 +285,24 @@ pub fn resolve_for_target(
         let actual = checker.expression(&constant.value, &[], Some(expected));
         checker.expect(expected, actual, constant.value.span);
         if cycles.contains(&constant.name) {
-            checker.errors.push(SemanticDiagnostic::new(
-                "E0702",
-                format!(
-                    "constant `{}` participates in a dependency cycle",
-                    constant.name
-                ),
-                constant.span,
-            ));
-        } else if let Some(value) =
-            eval_const_expression_with(&constant.value, &checker.constant_values)
-        {
-            check_const_value(&value, expected, constant.value.span, &mut checker.errors);
-            checker.constant_values.insert(constant.name.clone(), value);
+            checker.errors.push(const_eval_diagnostic(ConstEvalError {
+                kind: ConstEvalErrorKind::DependencyCycle,
+                span: constant.span,
+                operation: constant.name.clone(),
+                ty: Some(expected),
+            }));
         } else {
-            checker.errors.push(SemanticDiagnostic::new(
-                "E0701",
-                "constant initializer could not be evaluated; it may contain an unsupported operation or a forward reference",
-                constant.value.span,
-            ));
+            match const_eval::evaluate(
+                &constant.value,
+                Some(expected),
+                &checker.constant_values,
+                target.pointer_width,
+            ) {
+                Ok(value) => {
+                    checker.constant_values.insert(constant.name.clone(), value);
+                }
+                Err(error) => checker.errors.push(const_eval_diagnostic(error)),
+            }
         }
     }
     for function in &mut module.functions {
@@ -246,7 +314,7 @@ pub fn resolve_for_target(
 struct Checker {
     functions: HashMap<String, Signature>,
     constants: HashMap<String, Ty>,
-    constant_values: HashMap<String, crate::ir::Constant>,
+    constant_values: HashMap<String, TypedConstant>,
     errors: Vec<SemanticDiagnostic>,
     target: crate::target::TargetSpec,
 }
@@ -434,20 +502,28 @@ impl Checker {
         for scope in scopes.iter() {
             for (name, variable) in scope {
                 if let Some(value) = &variable.constant {
-                    const_env.insert(name.clone(), value.clone());
+                    const_env.insert(
+                        name.clone(),
+                        TypedConstant {
+                            ty: variable.ty,
+                            value: value.clone(),
+                        },
+                    );
                 }
             }
         }
-        let evaluated = eval_const_expression_with(&c.value, &const_env);
-        if let Some(value) = &evaluated {
-            check_const_value(value, expected, c.value.span, &mut self.errors);
-        } else {
-            self.errors.push(SemanticDiagnostic::new(
-                "E0701",
-                "constant initializer could not be evaluated at compile time",
-                c.value.span,
-            ));
-        }
+        let evaluated = match const_eval::evaluate(
+            &c.value,
+            Some(expected),
+            &const_env,
+            self.target.pointer_width,
+        ) {
+            Ok(value) => Some(value.value),
+            Err(error) => {
+                self.errors.push(const_eval_diagnostic(error));
+                None
+            }
+        };
         let scope = scopes.last_mut().unwrap();
         if scope.contains_key(&c.name) {
             self.errors.push(SemanticDiagnostic::new(
@@ -766,14 +842,35 @@ impl Checker {
                         format!("cannot cast `{src}` to `{target_ty}`"),
                         e.span,
                     ));
-                } else if is_const_expr(value)
-                    && const_cast(eval_const_expression(value).unwrap(), target_ty).is_none()
-                {
-                    self.errors.push(SemanticDiagnostic::new(
-                        "E0304",
-                        format!("constant value cannot be represented as `{target_ty}`"),
-                        e.span,
-                    ));
+                } else {
+                    let mut const_env = self.constant_values.clone();
+                    for scope in scopes.iter() {
+                        for (name, variable) in scope {
+                            if let Some(value) = &variable.constant {
+                                const_env.insert(
+                                    name.clone(),
+                                    TypedConstant {
+                                        ty: variable.ty,
+                                        value: value.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if let Err(error) = const_eval::evaluate(
+                        e,
+                        Some(target_ty),
+                        &const_env,
+                        self.target.pointer_width,
+                    ) {
+                        if !matches!(
+                            error.kind,
+                            ConstEvalErrorKind::InvalidDependency(_)
+                                | ConstEvalErrorKind::UnsupportedExpression
+                        ) {
+                            self.errors.push(const_eval_diagnostic(error));
+                        }
+                    }
                 }
                 target_ty
             }
@@ -885,13 +982,6 @@ fn integer_positive_max(signed: bool, width: u32) -> u128 {
         (1u128 << width) - 1
     }
 }
-fn integer_mask(width: u32) -> u128 {
-    if width == 128 {
-        u128::MAX
-    } else {
-        (1u128 << width) - 1
-    }
-}
 fn constant_cycles(constants: &[Constant]) -> HashSet<String> {
     fn refs(expr: &Expr, out: &mut HashSet<String>) {
         match &expr.kind {
@@ -961,277 +1051,4 @@ fn constant_cycles(constants: &[Constant]) -> HashSet<String> {
         }
     }
     cycles
-}
-fn is_const_expr(e: &Expr) -> bool {
-    eval_const_expression(e).is_some()
-}
-fn check_const_value(
-    value: &crate::ir::Constant,
-    ty: Ty,
-    span: Span,
-    errors: &mut Vec<SemanticDiagnostic>,
-) {
-    let bits = match value {
-        crate::ir::Constant::Integer(v) => *v as u128,
-        crate::ir::Constant::IntegerBits(v) => *v,
-        _ => return,
-    };
-    let width = ty.integer_width(64).unwrap();
-    let valid = if ty.is_signed_integer() {
-        let signed = if width == 128 {
-            bits as i128
-        } else {
-            let mask = (1u128 << width) - 1;
-            let value = bits & mask;
-            if value & (1u128 << (width - 1)) == 0 {
-                value as i128
-            } else {
-                (value | !mask) as i128
-            }
-        };
-        let min = if width == 128 {
-            i128::MIN
-        } else {
-            -(1i128 << (width - 1))
-        };
-        let max = if width == 128 {
-            i128::MAX
-        } else {
-            (1i128 << (width - 1)) - 1
-        };
-        signed >= min && signed <= max
-    } else {
-        width == 128 || bits < (1u128 << width)
-    };
-    if !valid {
-        errors.push(SemanticDiagnostic::new(
-            "E0305",
-            format!("constant value is outside the range of `{ty}`"),
-            span,
-        ));
-    }
-}
-pub(crate) fn eval_const_expression(e: &Expr) -> Option<crate::ir::Constant> {
-    eval_const_expression_with(e, &HashMap::new())
-}
-pub(crate) fn eval_const_expression_with(
-    e: &Expr,
-    constants: &HashMap<String, crate::ir::Constant>,
-) -> Option<crate::ir::Constant> {
-    match &e.kind {
-        ExprKind::Name(name) => constants.get(name).cloned(),
-        ExprKind::Integer(v) => {
-            let magnitude = v.magnitude()?;
-            Some(if magnitude <= i64::MAX as u128 {
-                crate::ir::Constant::Integer(magnitude as i64)
-            } else {
-                crate::ir::Constant::IntegerBits(magnitude)
-            })
-        }
-        ExprKind::Float(v) => Some(crate::ir::Constant::Float(*v)),
-        ExprKind::Bool(v) => Some(crate::ir::Constant::Bool(*v)),
-        ExprKind::Character(v) => Some(crate::ir::Constant::Character(*v)),
-        ExprKind::String(v) => Some(crate::ir::Constant::String(v.clone())),
-        ExprKind::Unary { op, value } if op == "!" => {
-            match eval_const_expression_with(value, constants)? {
-                crate::ir::Constant::Bool(v) => Some(crate::ir::Constant::Bool(!v)),
-                _ => None,
-            }
-        }
-        ExprKind::Unary { op, value } if op == "-" => {
-            match eval_const_expression_with(value, constants)? {
-                crate::ir::Constant::Integer(v) => {
-                    Some(crate::ir::Constant::Integer(v.checked_neg()?))
-                }
-                crate::ir::Constant::IntegerBits(v) => {
-                    Some(crate::ir::Constant::IntegerBits(0u128.wrapping_sub(v)))
-                }
-                crate::ir::Constant::Float(v) => Some(crate::ir::Constant::Float(-v)),
-                _ => None,
-            }
-        }
-        ExprKind::Cast { value, target } => {
-            let target = Ty::parse(target)?;
-            const_cast(eval_const_expression_with(value, constants)?, target)
-        }
-        ExprKind::Binary { left, op, right } => {
-            let a = eval_const_expression_with(left, constants)?;
-            if op == "&&" {
-                let crate::ir::Constant::Bool(a) = a else {
-                    return None;
-                };
-                if !a {
-                    return Some(crate::ir::Constant::Bool(false));
-                }
-                let crate::ir::Constant::Bool(b) = eval_const_expression_with(right, constants)?
-                else {
-                    return None;
-                };
-                return Some(crate::ir::Constant::Bool(b));
-            }
-            if op == "||" {
-                let crate::ir::Constant::Bool(a) = a else {
-                    return None;
-                };
-                if a {
-                    return Some(crate::ir::Constant::Bool(true));
-                }
-                let crate::ir::Constant::Bool(b) = eval_const_expression_with(right, constants)?
-                else {
-                    return None;
-                };
-                return Some(crate::ir::Constant::Bool(b));
-            }
-            let b = eval_const_expression_with(right, constants)?;
-            match (a, b) {
-                (crate::ir::Constant::Integer(a), crate::ir::Constant::Integer(b)) => {
-                    match op.as_str() {
-                        "+" => Some(crate::ir::Constant::Integer(a.checked_add(b)?)),
-                        "-" => Some(crate::ir::Constant::Integer(a.checked_sub(b)?)),
-                        "*" => Some(crate::ir::Constant::Integer(a.checked_mul(b)?)),
-                        "/" => Some(crate::ir::Constant::Integer(a.checked_div(b)?)),
-                        "%" => Some(crate::ir::Constant::Integer(a.checked_rem(b)?)),
-                        "&" => Some(crate::ir::Constant::Integer(a & b)),
-                        "|" => Some(crate::ir::Constant::Integer(a | b)),
-                        "^" => Some(crate::ir::Constant::Integer(a ^ b)),
-                        "<<" => checked_const_shift(a, b, 64).map(crate::ir::Constant::Integer),
-                        ">>" if (0..64).contains(&b) => Some(crate::ir::Constant::Integer(a >> b)),
-                        "==" => Some(crate::ir::Constant::Bool(a == b)),
-                        "!=" => Some(crate::ir::Constant::Bool(a != b)),
-                        "<" => Some(crate::ir::Constant::Bool(a < b)),
-                        "<=" => Some(crate::ir::Constant::Bool(a <= b)),
-                        ">" => Some(crate::ir::Constant::Bool(a > b)),
-                        ">=" => Some(crate::ir::Constant::Bool(a >= b)),
-                        _ => None,
-                    }
-                }
-                (crate::ir::Constant::Float(a), crate::ir::Constant::Float(b)) => match op.as_str()
-                {
-                    "+" => Some(crate::ir::Constant::Float(a + b)),
-                    "-" => Some(crate::ir::Constant::Float(a - b)),
-                    "*" => Some(crate::ir::Constant::Float(a * b)),
-                    "/" => Some(crate::ir::Constant::Float(a / b)),
-                    "==" => Some(crate::ir::Constant::Bool(a == b)),
-                    "!=" => Some(crate::ir::Constant::Bool(a != b)),
-                    "<" => Some(crate::ir::Constant::Bool(a < b)),
-                    "<=" => Some(crate::ir::Constant::Bool(a <= b)),
-                    ">" => Some(crate::ir::Constant::Bool(a > b)),
-                    ">=" => Some(crate::ir::Constant::Bool(a >= b)),
-                    _ => None,
-                },
-                (crate::ir::Constant::Bool(a), crate::ir::Constant::Bool(b)) => match op.as_str() {
-                    "==" => Some(crate::ir::Constant::Bool(a == b)),
-                    "!=" => Some(crate::ir::Constant::Bool(a != b)),
-                    _ => None,
-                },
-                (crate::ir::Constant::String(a), crate::ir::Constant::String(b)) => {
-                    match op.as_str() {
-                        "==" => Some(crate::ir::Constant::Bool(a == b)),
-                        "!=" => Some(crate::ir::Constant::Bool(a != b)),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-fn const_cast(value: crate::ir::Constant, target: Ty) -> Option<crate::ir::Constant> {
-    use crate::ir::Constant as C;
-    match (value, target) {
-        (C::Integer(v), t) if t.is_integer() => {
-            let width = t.integer_width(64)?;
-            let raw = if t.is_signed_integer() {
-                let min = if width == 128 {
-                    i128::MIN
-                } else {
-                    -(1i128 << (width - 1))
-                };
-                let max = if width == 128 {
-                    i128::MAX
-                } else {
-                    (1i128 << (width - 1)) - 1
-                };
-                let value = i128::from(v);
-                if value < min || value > max {
-                    return None;
-                }
-                (value as u128) & integer_mask(width)
-            } else {
-                if v < 0 || (v as u128) > integer_positive_max(false, width) {
-                    return None;
-                }
-                (v as u128) & integer_mask(width)
-            };
-            Some(if matches!(t, Ty::I32 | Ty::I64) {
-                C::Integer(v)
-            } else {
-                C::IntegerBits(raw)
-            })
-        }
-        (C::IntegerBits(v), t) if t.is_integer() => {
-            let width = t.integer_width(64)?;
-            if t.is_signed_integer() && v > integer_positive_max(true, width) {
-                return None;
-            }
-            if !t.is_signed_integer() && v > integer_positive_max(false, width) {
-                return None;
-            }
-            let bits = v & integer_mask(width);
-            Some(if matches!(t, Ty::I32 | Ty::I64) {
-                C::Integer(v as i64)
-            } else {
-                C::IntegerBits(bits)
-            })
-        }
-        (C::Integer(v), Ty::F32) => Some(C::Float((v as f32) as f64)),
-        (C::Integer(v), Ty::F64) => Some(C::Float(v as f64)),
-        (C::IntegerBits(v), Ty::F32) => Some(C::Float((v as f32) as f64)),
-        (C::IntegerBits(v), Ty::F64) => Some(C::Float(v as f64)),
-        (C::Float(v), t) if t.is_integer() => {
-            let width = t.integer_width(64)?;
-            let (lower, upper) = if t.is_signed_integer() {
-                (
-                    -2f64.powi((width - 1) as i32),
-                    2f64.powi((width - 1) as i32),
-                )
-            } else {
-                (0.0, 2f64.powi(width as i32))
-            };
-            if !v.is_finite() || v < lower || v >= upper {
-                return None;
-            }
-            let bits = if t.is_signed_integer() {
-                (v.trunc() as i128) as u128
-            } else {
-                v.trunc() as u128
-            };
-            let bits = bits & integer_mask(width);
-            Some(if matches!(t, Ty::I32 | Ty::I64) {
-                C::Integer(bits as i64)
-            } else {
-                C::IntegerBits(bits)
-            })
-        }
-        (C::Float(v), Ty::I32) if v.is_finite() && v >= i32::MIN as f64 && v < 2_147_483_648.0 => {
-            Some(C::Integer(i64::from(v.trunc() as i32)))
-        }
-        (C::Float(v), Ty::I64)
-            if v.is_finite() && v >= i64::MIN as f64 && v < 9_223_372_036_854_775_808.0 =>
-        {
-            Some(C::Integer(v.trunc() as i64))
-        }
-        (C::Float(v), Ty::F32) => Some(C::Float((v as f32) as f64)),
-        (C::Float(v), Ty::F64) => Some(C::Float(v)),
-        _ => None,
-    }
-}
-fn checked_const_shift(value: i64, count: i64, width: u32) -> Option<i64> {
-    if count < 0 || count >= i64::from(width) {
-        return None;
-    }
-    let count = count as u32;
-    let shifted = value.checked_shl(count)?;
-    ((shifted >> count) == value).then_some(shifted)
 }

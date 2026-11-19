@@ -220,7 +220,7 @@ fn validate_fn(f: &Function, sigs: &HashMap<String, Signature>, e: &mut Vec<Diag
                             width == 128 || (*v >> width) == 0
                         }
                         (Constant::Float(v), Some(Type::F32)) => {
-                            v.is_finite() && v.abs() <= f32::MAX as f64
+                            !v.is_finite() || v.abs() <= f32::MAX as f64
                         }
                         (Constant::Float(_), Some(Type::F64)) => true,
                         (Constant::String(_), Some(Type::Str)) => true,

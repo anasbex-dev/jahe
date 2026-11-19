@@ -4,7 +4,7 @@ JAHE is an experimental compiled systems programming language inspired by C and 
 
 ## Status
 
-Compiler 0.8 development extends canonical `func`/`let`/`var` syntax and the verified IR, interpreter, and Cranelift backend with all integer widths, float operations, Unicode scalar characters, short-circuit boolean logic, prior constant references, and limited `never` control flow. The scalar foundation remains partial: typed wide constant evaluation, forward-constant rules, general divergence analysis, exhaustive float/integer parity, and char ordering/casts are unfinished or awaiting specification. See the [implementation report](docs/compiler-0.8-implementation-report.md) for the feature matrix. Native builds emit COFF objects and link the static `jahe-runtime` library through MSVC on Windows x86_64. The project is experimental and not production-ready.
+Compiler 0.8 development extends canonical `func`/`let`/`var` syntax and the verified IR, interpreter, and Cranelift backend with all integer widths, float operations, Unicode scalar characters, short-circuit boolean logic, prior constant references, typed constant evaluation, and limited `never` control flow. The scalar foundation remains partial: exhaustive scalar boundary/parity tests, forward-constant rules, general divergence analysis, and char ordering/casts are unfinished or awaiting specification. See the [implementation report](docs/compiler-0.8-implementation-report.md) for the feature matrix and [open specification decisions](docs/specification-decisions-0.8.md) for unresolved rules. Native builds emit COFF objects and link the static `jahe-runtime` library through MSVC on Windows x86_64. The project is experimental and not production-ready.
 
 ## Build
 
